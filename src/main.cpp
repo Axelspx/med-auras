@@ -4,12 +4,16 @@
 
 #include <windows.h>
 #include <commctrl.h>
+#include <commdlg.h>
 #include <shellapi.h>
 #include <shlobj.h>
+#include <wincodec.h>
 
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cmath>
+#include <cstring>
 #include <cwchar>
 #include <filesystem>
 #include <iomanip>
@@ -42,6 +46,8 @@ constexpr UINT tray_icon_id = 1;
 std::vector<Medication> medications;
 std::filesystem::path medications_path;
 WidgetSettings widget_settings;
+IWICImagingFactory* imaging_factory{};
+std::vector<HBITMAP> medication_icons;
 bool enable_startup_after_save{};
 bool tray_icon_added{};
 UINT taskbar_created_message{};
@@ -149,6 +155,7 @@ INT_PTR CALLBACK medication_editor_procedure(
         SetWindowText(dialog, medication->id.empty() ? L"Add medication" : L"Edit medication");
         SetDlgItemText(dialog, IDC_MEDICATION_NAME, medication->name.c_str());
         SetDlgItemText(dialog, IDC_MEDICATION_DOSE, medication->dose.c_str());
+        SetDlgItemText(dialog, IDC_MEDICATION_ICON, medication->icon_path ? medication->icon_path->c_str() : L"");
         const DisplayInterval displayed = display_interval(medication->interval);
         SetDlgItemText(dialog, IDC_MEDICATION_INTERVAL, interval_text(displayed.value).c_str());
         const HWND unit = GetDlgItem(dialog, IDC_MEDICATION_UNIT);
@@ -169,16 +176,34 @@ INT_PTR CALLBACK medication_editor_procedure(
         EndDialog(dialog, IDCANCEL);
         return TRUE;
     }
+    if (LOWORD(w_param) == IDC_BROWSE_ICON) {
+        std::array<wchar_t, 32'768> path{};
+        GetDlgItemText(dialog, IDC_MEDICATION_ICON, path.data(), static_cast<int>(path.size()));
+        OPENFILENAME file{sizeof(OPENFILENAME)};
+        file.hwndOwner = dialog;
+        file.lpstrFilter = L"Images (*.png;*.jpg;*.jpeg;*.bmp;*.ico)\0*.png;*.jpg;*.jpeg;*.bmp;*.ico\0All files\0*.*\0";
+        file.lpstrFile = path.data();
+        file.nMaxFile = static_cast<DWORD>(path.size());
+        file.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
+        if (GetOpenFileName(&file)) SetDlgItemText(dialog, IDC_MEDICATION_ICON, path.data());
+        return TRUE;
+    }
+    if (LOWORD(w_param) == IDC_CLEAR_ICON) {
+        SetDlgItemText(dialog, IDC_MEDICATION_ICON, L"");
+        return TRUE;
+    }
     if (LOWORD(w_param) != IDOK) return FALSE;
 
     auto* medication = reinterpret_cast<Medication*>(GetWindowLongPtr(dialog, GWLP_USERDATA));
     std::array<wchar_t, 256> name{};
     std::array<wchar_t, 128> dose{};
     std::array<wchar_t, 32> interval_text{};
+    std::array<wchar_t, 32'768> icon_path{};
     GetDlgItemText(dialog, IDC_MEDICATION_NAME, name.data(), static_cast<int>(name.size()));
     GetDlgItemText(dialog, IDC_MEDICATION_DOSE, dose.data(), static_cast<int>(dose.size()));
     GetDlgItemText(
         dialog, IDC_MEDICATION_INTERVAL, interval_text.data(), static_cast<int>(interval_text.size()));
+    GetDlgItemText(dialog, IDC_MEDICATION_ICON, icon_path.data(), static_cast<int>(icon_path.size()));
 
     wchar_t* interval_end{};
     const double interval_value = std::wcstod(interval_text.data(), &interval_end);
@@ -204,6 +229,7 @@ INT_PTR CALLBACK medication_editor_procedure(
 
     medication->name = name.data();
     medication->dose = dose.data();
+    medication->icon_path = icon_path[0] == L'\0' ? std::nullopt : std::optional<std::wstring>{icon_path.data()};
     medication->interval = *interval;
     medication->last_taken_at = *start;
     EndDialog(dialog, IDOK);
@@ -249,6 +275,89 @@ void schedule_refresh(const HWND window) {
 
 void save_state() {
     save_medications(medications_path, medications, widget_settings);
+}
+
+void clear_medication_icons() {
+    for (const HBITMAP icon : medication_icons) {
+        if (icon) DeleteObject(icon);
+    }
+    medication_icons.clear();
+}
+
+HBITMAP load_medication_icon(const std::wstring& path) {
+    if (!imaging_factory) return nullptr;
+
+    IWICBitmapDecoder* decoder{};
+    IWICBitmapFrameDecode* frame{};
+    IWICBitmapScaler* scaler{};
+    IWICFormatConverter* converter{};
+    HBITMAP bitmap{};
+    void* pixels{};
+    UINT width{};
+    UINT height{};
+    UINT scaled_width{};
+    UINT scaled_height{};
+
+    HRESULT result = imaging_factory->CreateDecoderFromFilename(
+        path.c_str(), nullptr, GENERIC_READ, WICDecodeMetadataCacheOnLoad, &decoder);
+    if (SUCCEEDED(result)) result = decoder->GetFrame(0, &frame);
+    if (SUCCEEDED(result)) result = frame->GetSize(&width, &height);
+    if (SUCCEEDED(result) && width > 0 && height > 0) {
+        const double scale = std::min(48.0 / width, 48.0 / height);
+        scaled_width = std::max(1U, static_cast<UINT>(std::lround(width * scale)));
+        scaled_height = std::max(1U, static_cast<UINT>(std::lround(height * scale)));
+        result = imaging_factory->CreateBitmapScaler(&scaler);
+    } else if (SUCCEEDED(result)) {
+        result = E_FAIL;
+    }
+    if (SUCCEEDED(result)) {
+        result = scaler->Initialize(frame, scaled_width, scaled_height, WICBitmapInterpolationModeFant);
+    }
+    if (SUCCEEDED(result)) result = imaging_factory->CreateFormatConverter(&converter);
+    if (SUCCEEDED(result)) {
+        result = converter->Initialize(
+            scaler, GUID_WICPixelFormat32bppPBGRA, WICBitmapDitherTypeNone, nullptr, 0.0,
+            WICBitmapPaletteTypeCustom);
+    }
+    if (SUCCEEDED(result)) {
+        BITMAPINFO info{};
+        info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+        info.bmiHeader.biWidth = 48;
+        info.bmiHeader.biHeight = -48;
+        info.bmiHeader.biPlanes = 1;
+        info.bmiHeader.biBitCount = 32;
+        info.bmiHeader.biCompression = BI_RGB;
+        const HDC device = GetDC(nullptr);
+        bitmap = CreateDIBSection(device, &info, DIB_RGB_COLORS, &pixels, nullptr, 0);
+        ReleaseDC(nullptr, device);
+        if (!bitmap || !pixels) result = E_OUTOFMEMORY;
+    }
+    if (SUCCEEDED(result)) {
+        constexpr UINT stride = 48 * 4;
+        std::memset(pixels, 0, 48 * stride);
+        auto* destination = static_cast<BYTE*>(pixels) + ((48 - scaled_height) / 2 * 48 +
+                                                          (48 - scaled_width) / 2) * 4;
+        const UINT buffer_size = stride * (scaled_height - 1) + scaled_width * 4;
+        result = converter->CopyPixels(nullptr, stride, buffer_size, destination);
+    }
+
+    if (converter) converter->Release();
+    if (scaler) scaler->Release();
+    if (frame) frame->Release();
+    if (decoder) decoder->Release();
+    if (FAILED(result) && bitmap) {
+        DeleteObject(bitmap);
+        bitmap = nullptr;
+    }
+    return bitmap;
+}
+
+void rebuild_medication_icons() {
+    clear_medication_icons();
+    medication_icons.reserve(medications.size());
+    for (const Medication& medication : medications) {
+        medication_icons.push_back(medication.icon_path ? load_medication_icon(*medication.icon_path) : nullptr);
+    }
 }
 
 NOTIFYICONDATA tray_icon_data(const HWND window) {
@@ -388,6 +497,7 @@ bool create_taken_buttons(const HWND window) {
 
 bool rebuild_widget(const HWND window) {
     while (const HWND child = GetWindow(window, GW_CHILD)) DestroyWindow(child);
+    rebuild_medication_icons();
     if (!create_taken_buttons(window)) return false;
     SetWindowPos(
         window, nullptr, 0, 0, 420, widget_height(), SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
@@ -434,10 +544,19 @@ void paint_widget(const HWND window) {
         FillRect(device, &row_bounds, row);
         DeleteObject(row);
 
-        const HBRUSH icon = CreateSolidBrush(medication.enabled ? RGB(66, 82, 110) : RGB(72, 74, 78));
         const RECT icon_bounds{22, top + 14, 70, top + 62};
-        FillRect(device, &icon_bounds, icon);
-        DeleteObject(icon);
+        if (index < medication_icons.size() && medication_icons[index]) {
+            const HDC memory = CreateCompatibleDC(device);
+            const HGDIOBJ previous = SelectObject(memory, medication_icons[index]);
+            const BLENDFUNCTION blend{AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
+            AlphaBlend(device, icon_bounds.left, icon_bounds.top, 48, 48, memory, 0, 0, 48, 48, blend);
+            SelectObject(memory, previous);
+            DeleteDC(memory);
+        } else {
+            const HBRUSH icon = CreateSolidBrush(medication.enabled ? RGB(66, 82, 110) : RGB(72, 74, 78));
+            FillRect(device, &icon_bounds, icon);
+            DeleteObject(icon);
+        }
 
         SetBkMode(device, TRANSPARENT);
         SetTextColor(device, RGB(239, 242, 247));
@@ -567,6 +686,7 @@ LRESULT CALLBACK window_procedure(const HWND window, const UINT message, const W
                         window, L"The medication changes could not be saved.", L"Medication Cooldown Widget",
                         MB_OK | MB_ICONERROR);
                 }
+                rebuild_medication_icons();
                 schedule_refresh(window);
                 InvalidateRect(window, nullptr, FALSE);
             }
@@ -696,6 +816,7 @@ LRESULT CALLBACK window_procedure(const HWND window, const UINT message, const W
     case WM_DESTROY:
         KillTimer(window, refresh_timer);
         remove_tray_icon(window);
+        clear_medication_icons();
         PostQuitMessage(0);
         return 0;
     default:
@@ -706,6 +827,21 @@ LRESULT CALLBACK window_procedure(const HWND window, const UINT message, const W
 }
 
 int WINAPI wWinMain(const HINSTANCE instance, HINSTANCE, PWSTR, const int show_command) {
+    const HRESULT com_result = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    struct ComCleanup {
+        bool uninitialize;
+        ~ComCleanup() {
+            clear_medication_icons();
+            if (imaging_factory) imaging_factory->Release();
+            if (uninitialize) CoUninitialize();
+        }
+    } cleanup{SUCCEEDED(com_result)};
+    if (SUCCEEDED(com_result) || com_result == RPC_E_CHANGED_MODE) {
+        CoCreateInstance(
+            CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_IWICImagingFactory,
+            reinterpret_cast<void**>(&imaging_factory));
+    }
+
     const INITCOMMONCONTROLSEX common_controls{sizeof(INITCOMMONCONTROLSEX), ICC_DATE_CLASSES};
     if (!InitCommonControlsEx(&common_controls)) return 1;
 
@@ -720,6 +856,7 @@ int WINAPI wWinMain(const HINSTANCE instance, HINSTANCE, PWSTR, const int show_c
         return 1;
     }
     if (medications.empty() && configuration_missing) medications.push_back(example_medication());
+    rebuild_medication_icons();
 
     taskbar_created_message = RegisterWindowMessage(L"TaskbarCreated");
     if (taskbar_created_message == 0) {

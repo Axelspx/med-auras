@@ -220,8 +220,9 @@ The current build includes:
 - system-tray show/hide, startup toggle, and exit controls
 - widget dragging with restorable on-screen position
 - persistent position locking and always-on-top controls
+- optional local medication icons with native image selection and placeholder fallback
 
-Not yet implemented: medication icon selection/rendering and final visual polish.
+Not yet implemented: final visual, DPI, and interaction polish.
 
 ### Build and run in CLion
 

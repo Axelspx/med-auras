@@ -55,7 +55,7 @@ service, scheduled task, installer, or background helper is introduced.
 
 ## Milestone 2 — Restorable placement and window controls
 
-**Status: Implementation and automated verification complete; manual interaction acceptance pending.**
+**Status: Complete — automated builds/tests and manual interaction acceptance passed on 2026-08-13.**
 
 ### Outcome
 
@@ -93,6 +93,8 @@ added. Tray visibility remains session state rather than another persisted prefe
 
 ## Milestone 3 — Medication icon selection and rendering
 
+**Status: Complete — automated builds/tests and manual interaction acceptance passed on 2026-08-13.**
+
 ### Outcome
 
 Each medication can optionally use a user-selected local image, while missing or invalid images degrade to a polished
@@ -123,6 +125,8 @@ No bundled medication catalogue, web search, asset downloads, image editor, anim
 added.
 
 ## Milestone 4 — Glanceability, DPI, and interaction polish
+
+**Status: In progress.**
 
 ### Outcome
 
