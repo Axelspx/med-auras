@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Lesson 2: Build your first Win32 window</title>
+  <link rel="stylesheet" href="../assets/lesson.css">
+</head>
+<body>
+  <main>
+    <p>Medication Cooldown Widget · Lesson 2</p>
+    <h1>Build and run your first native window</h1>
+    <p><strong>Tangible win:</strong> click Run in CLion and see a Windows application built from this repository.</p>
+
+    <h2>What was added</h2>
+    <ul>
+      <li><code>CMakeLists.txt</code> is the build recipe. It creates one C++20 Windows executable named <code>med-auras</code>.</li>
+      <li><code>src/main.cpp</code> registers a window type, creates one window, and waits for Windows messages.</li>
+    </ul>
+
+    <h2>Do this in CLion</h2>
+    <ol class="checklist">
+      <li>Return to CLion. If it does not load the new file automatically, choose <strong>Tools → CMake → Reload CMake Project</strong>.</li>
+      <li>Wait until indexing and CMake configuration finish. The target selector near the top should say <strong>med-auras</strong>.</li>
+      <li>Click the green <strong>Run</strong> triangle, or press <strong>Shift+F10</strong>.</li>
+      <li>A plain window titled <strong>Medication Cooldown Widget</strong> should appear. Close it with the normal X button.</li>
+    </ol>
+
+    <h2>The mental model</h2>
+    <pre><code>CMakeLists.txt → MSVC compiler → med-auras.exe
+                                      ↓
+                           Windows sends messages
+                                      ↓
+                         window_procedure handles them</code></pre>
+    <p>The <code>GetMessage</code> call waits efficiently until Windows has something to report. It is not a continuously running polling loop, so it fits the project's near-zero idle CPU requirement.</p>
+
+    <h2>Try the debugger once</h2>
+    <ol class="checklist">
+      <li>Open <code>src/main.cpp</code>.</li>
+      <li>Click the gutter beside <code>ShowWindow(window, show_command);</code> to create a red breakpoint.</li>
+      <li>Click the bug-shaped <strong>Debug</strong> button, or press <strong>Shift+F9</strong>.</li>
+      <li>When execution pauses, inspect the <code>window</code> variable, then click <strong>Resume</strong>.</li>
+      <li>Remove the breakpoint by clicking it again.</li>
+    </ol>
+
+    <div class="result">
+      <strong>Retrieval check:</strong> without looking above, identify which file describes the build and which function receives Windows events. Tell the agent your answer along with whether Run and Debug worked.
+    </div>
+
+    <h2>Primary reference</h2>
+    <p>Microsoft's <a href="https://learn.microsoft.com/en-us/cpp/windows/walkthrough-creating-windows-desktop-applications-cpp">traditional Windows desktop application walkthrough</a> expands on this exact application structure.</p>
+
+    <p>If CLion shows an error, copy the complete first error—not only the final “build failed” line—and ask the agent.</p>
+  </main>
+</body>
+</html>
