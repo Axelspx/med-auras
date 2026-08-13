@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Lesson 1: Set up CLion and MSVC</title>
+  <link rel="stylesheet" href="../assets/lesson.css">
+</head>
+<body>
+  <main>
+    <p>Medication Cooldown Widget · Lesson 1</p>
+    <h1>Connect a C++ IDE to your Windows compiler</h1>
+    <p><strong>Tangible win:</strong> finish with CLion able to detect the Microsoft compiler and CMake already installed on this computer.</p>
+
+    <div class="callout">
+      <strong>Important:</strong> IntelliJ IDEA and CLion look similar because both are JetBrains IDEs, but JetBrains does not officially support C++ in IntelliJ IDEA. Use CLion for this repository.
+    </div>
+
+    <h2>The three pieces</h2>
+    <ul>
+      <li><strong>CLion</strong> is the editor, project view, Run button, and debugger.</li>
+      <li><strong>MSVC</strong> is the compiler that translates C++ into a Windows executable.</li>
+      <li><strong>CMake</strong> reads <code>CMakeLists.txt</code> and tells MSVC which files and Windows libraries belong to the executable.</li>
+    </ul>
+    <p>This PC already has Visual Studio Build Tools 2026, its C++ workload, the 64-bit compiler environment, and CMake 4.1.1. MSVC often does not appear in a normal terminal's <code>PATH</code>; CLion initializes it through Visual Studio's environment script.</p>
+
+    <h2>Do this now</h2>
+    <ol class="checklist">
+      <li>Install <a href="https://www.jetbrains.com/clion/download/">CLion</a>, preferably through JetBrains Toolbox if you already use it. You do not need to uninstall IntelliJ IDEA.</li>
+      <li>Start CLion and open <code>C:\Users\axels\Documents\IntelliJ\med-auras</code>.</li>
+      <li>Open <strong>File → Settings → Build, Execution, Deployment → Toolchains</strong>.</li>
+      <li>Add or select <strong>Visual Studio</strong>. Choose the detected Visual Studio Build Tools 2026 installation and set Architecture to <strong>amd64</strong>.</li>
+      <li>Confirm that C compiler, C++ compiler, debugger, CMake, and build tool show successful detection rather than red errors.</li>
+      <li>Click <strong>Apply</strong>, then <strong>OK</strong>.</li>
+    </ol>
+
+    <h2>What happens next</h2>
+    <p>The repository currently has requirements documents but no <code>CMakeLists.txt</code> or <code>src/main.cpp</code>. That is expected: the next lesson will add the smallest buildable C++20 Win32 application. Once those files exist, CLion will load the CMake target and show Run and Debug controls.</p>
+
+    <div class="result">
+      <strong>Self-check:</strong> explain aloud which tool edits the code, which tool compiles it, and which file describes the build. If you can answer “CLion, MSVC, and CMakeLists.txt,” the mental model is in place.
+    </div>
+
+    <h2>Primary references</h2>
+    <p>Use JetBrains' official <a href="https://www.jetbrains.com/help/clion/quick-tutorial-on-configuring-clion-on-windows.html">Windows toolchain tutorial</a> if the fields do not auto-detect. Microsoft's <a href="https://learn.microsoft.com/en-us/visualstudio/install/workload-component-id-vs-build-tools?view=visualstudio">C++ Build Tools workload reference</a> explains the installed components.</p>
+
+    <p>When a screen or error differs from this lesson, ask the agent and include a screenshot or the exact error text.</p>
+  </main>
+</body>
+</html>
