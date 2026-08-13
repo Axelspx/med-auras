@@ -126,7 +126,7 @@ added.
 
 ## Milestone 4 — Glanceability, DPI, and interaction polish
 
-**Status: In progress.**
+**Status: Implementation and automated verification complete; manual interaction acceptance pending.**
 
 ### Outcome
 

@@ -25,5 +25,6 @@ struct Medication {
     [[nodiscard]] std::optional<std::chrono::system_clock::time_point> next_available_at() const;
     [[nodiscard]] std::chrono::minutes remaining_at(std::chrono::system_clock::time_point now) const;
     [[nodiscard]] bool is_ready_at(std::chrono::system_clock::time_point now) const;
+    [[nodiscard]] bool is_soon_at(std::chrono::system_clock::time_point now) const;
     void mark_taken(std::chrono::system_clock::time_point now);
 };

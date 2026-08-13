@@ -1,5 +1,6 @@
 #include "medication.h"
 
+#include <algorithm>
 #include <cmath>
 #include <limits>
 
@@ -32,6 +33,12 @@ std::chrono::minutes Medication::remaining_at(const std::chrono::system_clock::t
 
 bool Medication::is_ready_at(const std::chrono::system_clock::time_point now) const {
     return enabled && remaining_at(now) == std::chrono::minutes::zero();
+}
+
+bool Medication::is_soon_at(const std::chrono::system_clock::time_point now) const {
+    const std::chrono::minutes remaining = remaining_at(now);
+    return enabled && remaining > std::chrono::minutes::zero() &&
+           remaining <= std::max(std::chrono::minutes{1}, interval / 10);
 }
 
 void Medication::mark_taken(const std::chrono::system_clock::time_point now) {

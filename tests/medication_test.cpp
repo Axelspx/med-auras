@@ -36,6 +36,8 @@ int main() {
     medication.mark_taken(now);
     CHECK(medication.next_available_at() == now + 12h);
     CHECK(medication.remaining_at(now + 11h) == 60min);
+    CHECK(!medication.is_soon_at(now + 10h + 47min));
+    CHECK(medication.is_soon_at(now + 10h + 48min));
     CHECK(medication.is_ready_at(now + 12h));
 
     medication.enabled = false;

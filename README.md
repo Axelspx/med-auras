@@ -221,8 +221,9 @@ The current build includes:
 - widget dragging with restorable on-screen position
 - persistent position locking and always-on-top controls
 - optional local medication icons with native image selection and placeholder fallback
+- per-monitor DPI-aware layout, explicit cooldown state labels, local timestamps, and keyboard navigation
 
-Not yet implemented: final visual, DPI, and interaction polish.
+Not yet complete: final release/resource verification and the full manual acceptance matrix.
 
 ### Build and run in CLion
 

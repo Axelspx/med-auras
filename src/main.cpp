@@ -28,9 +28,11 @@ namespace {
 constexpr wchar_t window_class[] = L"MedAurasWindow";
 constexpr UINT_PTR refresh_timer = 1;
 constexpr int first_taken_button_id = 100;
+constexpr int widget_width_dip = 420;
 constexpr int row_top = 12;
 constexpr int row_step = 80;
 constexpr int row_height = 76;
+constexpr int icon_size_dip = 48;
 constexpr UINT toggle_paused_command = 1;
 constexpr UINT remove_medication_command = 2;
 constexpr UINT edit_medication_command = 3;
@@ -48,9 +50,45 @@ std::filesystem::path medications_path;
 WidgetSettings widget_settings;
 IWICImagingFactory* imaging_factory{};
 std::vector<HBITMAP> medication_icons;
+HFONT widget_font{};
+HFONT widget_font_bold{};
+UINT widget_dpi = 96;
 bool enable_startup_after_save{};
 bool tray_icon_added{};
 UINT taskbar_created_message{};
+
+int scaled(const int value) {
+    return MulDiv(value, static_cast<int>(widget_dpi), 96);
+}
+
+int widget_width() {
+    return scaled(widget_width_dip);
+}
+
+void enable_per_monitor_dpi() {
+    using SetDpiAwareness = BOOL(WINAPI*)(HANDLE);
+    const auto set_awareness = reinterpret_cast<SetDpiAwareness>(
+        GetProcAddress(GetModuleHandle(L"user32.dll"), "SetProcessDpiAwarenessContext"));
+    if (set_awareness) set_awareness(reinterpret_cast<HANDLE>(-4));
+}
+
+UINT system_dpi() {
+    using GetDpi = UINT(WINAPI*)();
+    const auto get_dpi =
+        reinterpret_cast<GetDpi>(GetProcAddress(GetModuleHandle(L"user32.dll"), "GetDpiForSystem"));
+    if (get_dpi) return get_dpi();
+    const HDC device = GetDC(nullptr);
+    const UINT dpi = device ? static_cast<UINT>(GetDeviceCaps(device, LOGPIXELSX)) : 96;
+    if (device) ReleaseDC(nullptr, device);
+    return dpi;
+}
+
+UINT window_dpi(const HWND window) {
+    using GetDpi = UINT(WINAPI*)(HWND);
+    const auto get_dpi =
+        reinterpret_cast<GetDpi>(GetProcAddress(GetModuleHandle(L"user32.dll"), "GetDpiForWindow"));
+    return get_dpi ? get_dpi(window) : system_dpi();
+}
 
 std::filesystem::path local_medications_path() {
     PWSTR local_app_data{};
@@ -72,8 +110,8 @@ Medication example_medication() {
 }
 
 int widget_height() {
-    if (medications.empty()) return 60;
-    return row_top * 2 + static_cast<int>(medications.size()) * row_step - (row_step - row_height);
+    if (medications.empty()) return scaled(60);
+    return scaled(row_top * 2 + static_cast<int>(medications.size()) * row_step - (row_step - row_height));
 }
 
 void enable_startup_if_needed(const HWND window) {
@@ -252,14 +290,43 @@ std::wstring new_medication_id() {
            std::to_wstring(std::chrono::system_clock::now().time_since_epoch().count());
 }
 
-std::wstring remaining_text(const Medication& medication, const std::chrono::system_clock::time_point now) {
+std::wstring status_text(const Medication& medication, const std::chrono::system_clock::time_point now) {
     if (!medication.enabled) return L"PAUSED";
     const std::chrono::minutes remaining = medication.remaining_at(now);
     if (remaining == std::chrono::minutes::zero()) return L"READY";
+    return medication.is_soon_at(now) ? L"SOON" : L"ACTIVE";
+}
+
+std::wstring countdown_text(const Medication& medication, const std::chrono::system_clock::time_point now) {
+    if (!medication.enabled) return {};
+    const std::chrono::minutes remaining = medication.remaining_at(now);
+    if (remaining == std::chrono::minutes::zero()) return {};
     const auto hours = std::chrono::duration_cast<std::chrono::hours>(remaining);
     const auto minutes = remaining - hours;
-    if (hours == std::chrono::hours::zero()) return std::to_wstring(minutes.count()) + L"m";
-    return std::to_wstring(hours.count()) + L"h " + std::to_wstring(minutes.count()) + L"m";
+    return hours == std::chrono::hours::zero()
+               ? std::to_wstring(minutes.count()) + L"m"
+               : std::to_wstring(hours.count()) + L"h " + std::to_wstring(minutes.count()) + L"m";
+}
+
+std::wstring local_timestamp_text(
+    const Medication& medication, const std::chrono::system_clock::time_point now) {
+    const auto timestamp = medication.remaining_at(now) > std::chrono::minutes::zero()
+                               ? medication.next_available_at()
+                               : medication.last_taken_at;
+    if (!timestamp) return {};
+
+    const SYSTEMTIME local = local_time_for(*timestamp);
+    std::array<wchar_t, 32> date{};
+    std::array<wchar_t, 32> time{};
+    if (!GetDateFormatEx(
+            LOCALE_NAME_USER_DEFAULT, 0, &local, L"dd MMM", date.data(), static_cast<int>(date.size()), nullptr) ||
+        !GetTimeFormatEx(
+            LOCALE_NAME_USER_DEFAULT, TIME_NOSECONDS, &local, nullptr, time.data(),
+            static_cast<int>(time.size()))) {
+        return {};
+    }
+    return std::wstring{medication.remaining_at(now) > std::chrono::minutes::zero() ? L"Next " : L"Last "} +
+           date.data() + L" " + time.data();
 }
 
 void schedule_refresh(const HWND window) {
@@ -284,6 +351,18 @@ void clear_medication_icons() {
     medication_icons.clear();
 }
 
+void rebuild_fonts() {
+    if (widget_font) DeleteObject(widget_font);
+    if (widget_font_bold) DeleteObject(widget_font_bold);
+    const int height = -MulDiv(9, static_cast<int>(widget_dpi), 72);
+    widget_font = CreateFont(
+        height, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
+        CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
+    widget_font_bold = CreateFont(
+        height, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
+        CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
+}
+
 HBITMAP load_medication_icon(const std::wstring& path) {
     if (!imaging_factory) return nullptr;
 
@@ -297,13 +376,14 @@ HBITMAP load_medication_icon(const std::wstring& path) {
     UINT height{};
     UINT scaled_width{};
     UINT scaled_height{};
+    const UINT icon_size = static_cast<UINT>(scaled(icon_size_dip));
 
     HRESULT result = imaging_factory->CreateDecoderFromFilename(
         path.c_str(), nullptr, GENERIC_READ, WICDecodeMetadataCacheOnLoad, &decoder);
     if (SUCCEEDED(result)) result = decoder->GetFrame(0, &frame);
     if (SUCCEEDED(result)) result = frame->GetSize(&width, &height);
     if (SUCCEEDED(result) && width > 0 && height > 0) {
-        const double scale = std::min(48.0 / width, 48.0 / height);
+        const double scale = std::min(static_cast<double>(icon_size) / width, static_cast<double>(icon_size) / height);
         scaled_width = std::max(1U, static_cast<UINT>(std::lround(width * scale)));
         scaled_height = std::max(1U, static_cast<UINT>(std::lround(height * scale)));
         result = imaging_factory->CreateBitmapScaler(&scaler);
@@ -322,8 +402,8 @@ HBITMAP load_medication_icon(const std::wstring& path) {
     if (SUCCEEDED(result)) {
         BITMAPINFO info{};
         info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-        info.bmiHeader.biWidth = 48;
-        info.bmiHeader.biHeight = -48;
+        info.bmiHeader.biWidth = static_cast<LONG>(icon_size);
+        info.bmiHeader.biHeight = -static_cast<LONG>(icon_size);
         info.bmiHeader.biPlanes = 1;
         info.bmiHeader.biBitCount = 32;
         info.bmiHeader.biCompression = BI_RGB;
@@ -333,10 +413,10 @@ HBITMAP load_medication_icon(const std::wstring& path) {
         if (!bitmap || !pixels) result = E_OUTOFMEMORY;
     }
     if (SUCCEEDED(result)) {
-        constexpr UINT stride = 48 * 4;
-        std::memset(pixels, 0, 48 * stride);
-        auto* destination = static_cast<BYTE*>(pixels) + ((48 - scaled_height) / 2 * 48 +
-                                                          (48 - scaled_width) / 2) * 4;
+        const UINT stride = icon_size * 4;
+        std::memset(pixels, 0, icon_size * stride);
+        auto* destination = static_cast<BYTE*>(pixels) + ((icon_size - scaled_height) / 2 * icon_size +
+                                                          (icon_size - scaled_width) / 2) * 4;
         const UINT buffer_size = stride * (scaled_height - 1) + scaled_width * 4;
         result = converter->CopyPixels(nullptr, stride, buffer_size, destination);
     }
@@ -397,7 +477,7 @@ POINT clamped_widget_position(const POINT position) {
     MONITORINFO info{sizeof(MONITORINFO)};
     if (!monitor || !GetMonitorInfo(monitor, &info)) return position;
     return POINT{
-        std::clamp(position.x, info.rcWork.left, std::max(info.rcWork.left, info.rcWork.right - 420)),
+        std::clamp(position.x, info.rcWork.left, std::max(info.rcWork.left, info.rcWork.right - widget_width())),
         std::clamp(position.y, info.rcWork.top, std::max(info.rcWork.top, info.rcWork.bottom - widget_height())),
     };
 }
@@ -470,14 +550,17 @@ void show_tray_menu(const HWND window, const POINT point) {
 
 std::optional<std::size_t> medication_at(const HWND window, POINT point) {
     if (point.x == -1 && point.y == -1) {
-        if (medications.empty()) return std::nullopt;
-        return 0;
+        const int focused_index = GetDlgCtrlID(GetFocus()) - first_taken_button_id;
+        if (focused_index >= 0 && static_cast<std::size_t>(focused_index) < medications.size()) {
+            return static_cast<std::size_t>(focused_index);
+        }
+        return medications.empty() ? std::nullopt : std::optional<std::size_t>{0};
     }
     ScreenToClient(window, &point);
-    if (point.x < 12 || point.x >= 408 || point.y < row_top) return std::nullopt;
-    const int offset = point.y - row_top;
-    const std::size_t index = static_cast<std::size_t>(offset / row_step);
-    if (offset % row_step >= row_height || index >= medications.size()) return std::nullopt;
+    if (point.x < scaled(12) || point.x >= scaled(408) || point.y < scaled(row_top)) return std::nullopt;
+    const int offset = point.y - scaled(row_top);
+    const std::size_t index = static_cast<std::size_t>(offset / scaled(row_step));
+    if (offset % scaled(row_step) >= scaled(row_height) || index >= medications.size()) return std::nullopt;
     return index;
 }
 
@@ -485,11 +568,11 @@ bool create_taken_buttons(const HWND window) {
     for (std::size_t index = 0; index < medications.size(); ++index) {
         const int button_id = first_taken_button_id + static_cast<int>(index);
         const HWND button = CreateWindow(
-            L"BUTTON", L"Taken", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON, 322,
-            row_top + static_cast<int>(index * row_step) + 20, 76, 36, window,
+            L"BUTTON", L"Taken", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON, scaled(322),
+            scaled(row_top + static_cast<int>(index * row_step) + 20), scaled(76), scaled(36), window,
             reinterpret_cast<HMENU>(static_cast<INT_PTR>(button_id)), GetModuleHandle(nullptr), nullptr);
         if (!button) return false;
-        SendMessage(button, WM_SETFONT, reinterpret_cast<WPARAM>(GetStockObject(DEFAULT_GUI_FONT)), TRUE);
+        SendMessage(button, WM_SETFONT, reinterpret_cast<WPARAM>(widget_font), TRUE);
         EnableWindow(button, medications[index].enabled);
     }
     return true;
@@ -500,7 +583,7 @@ bool rebuild_widget(const HWND window) {
     rebuild_medication_icons();
     if (!create_taken_buttons(window)) return false;
     SetWindowPos(
-        window, nullptr, 0, 0, 420, widget_height(), SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+        window, nullptr, 0, 0, widget_width(), widget_height(), SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
     RECT bounds{};
     if (GetWindowRect(window, &bounds)) {
         const POINT clamped = clamped_widget_position({bounds.left, bounds.top});
@@ -529,64 +612,97 @@ void paint_widget(const HWND window) {
     if (medications.empty()) {
         SetBkMode(device, TRANSPARENT);
         SetTextColor(device, RGB(174, 180, 190));
-        SelectObject(device, GetStockObject(DEFAULT_GUI_FONT));
+        SelectObject(device, widget_font);
         DrawText(device, L"Right-click to add medication", -1, &client, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
     }
 
     const auto now = std::chrono::system_clock::now();
     for (std::size_t index = 0; index < medications.size(); ++index) {
         const Medication& medication = medications[index];
-        const LONG top = row_top + static_cast<LONG>(index * row_step);
+        const LONG top = scaled(row_top + static_cast<int>(index * row_step));
         const std::chrono::minutes remaining = medication.remaining_at(now);
+        const bool ready = medication.enabled && remaining == std::chrono::minutes::zero();
+        const bool soon = medication.is_soon_at(now);
 
         const HBRUSH row = CreateSolidBrush(medication.enabled ? RGB(31, 36, 45) : RGB(37, 39, 43));
-        const RECT row_bounds{12, top, 408, top + row_height};
+        const RECT row_bounds{scaled(12), top, scaled(408), top + scaled(row_height)};
         FillRect(device, &row_bounds, row);
         DeleteObject(row);
 
-        const RECT icon_bounds{22, top + 14, 70, top + 62};
+        const RECT icon_bounds{scaled(22), top + scaled(14), scaled(70), top + scaled(62)};
+        const int icon_size = scaled(icon_size_dip);
         if (index < medication_icons.size() && medication_icons[index]) {
             const HDC memory = CreateCompatibleDC(device);
             const HGDIOBJ previous = SelectObject(memory, medication_icons[index]);
             const BLENDFUNCTION blend{AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
-            AlphaBlend(device, icon_bounds.left, icon_bounds.top, 48, 48, memory, 0, 0, 48, 48, blend);
+            AlphaBlend(
+                device, icon_bounds.left, icon_bounds.top, icon_size, icon_size, memory, 0, 0, icon_size, icon_size,
+                blend);
             SelectObject(memory, previous);
             DeleteDC(memory);
         } else {
             const HBRUSH icon = CreateSolidBrush(medication.enabled ? RGB(66, 82, 110) : RGB(72, 74, 78));
             FillRect(device, &icon_bounds, icon);
             DeleteObject(icon);
+            if (!medication.name.empty()) {
+                SetBkMode(device, TRANSPARENT);
+                SetTextColor(device, RGB(239, 242, 247));
+                SelectObject(device, widget_font_bold);
+                const wchar_t initial[]{medication.name.front(), L'\0'};
+                RECT initial_bounds = icon_bounds;
+                DrawText(device, initial, 1, &initial_bounds, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            }
         }
 
         SetBkMode(device, TRANSPARENT);
         SetTextColor(device, RGB(239, 242, 247));
-        SelectObject(device, GetStockObject(DEFAULT_GUI_FONT));
-        RECT name_bounds{82, top + 10, 300, top + 31};
+        SelectObject(device, widget_font_bold);
+        RECT name_bounds{scaled(82), top + scaled(8), scaled(210), top + scaled(29)};
         const std::wstring label = medication.name + (medication.dose.empty() ? L"" : L"  " + medication.dose);
         DrawText(device, label.c_str(), -1, &name_bounds, DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS);
 
-        const std::wstring status = remaining_text(medication, now);
-        SetTextColor(device, medication.enabled && remaining == std::chrono::minutes::zero() ? RGB(104, 218, 142)
-                                                                                             : RGB(205, 211, 221));
-        RECT status_bounds{238, top + 10, 312, top + 31};
+        const std::wstring status = status_text(medication, now);
+        SetTextColor(
+            device, !medication.enabled ? RGB(166, 171, 180)
+                    : ready             ? RGB(104, 218, 142)
+                    : soon              ? RGB(240, 178, 72)
+                                        : RGB(205, 211, 221));
+        RECT status_bounds{scaled(212), top + scaled(8), scaled(312), top + scaled(29)};
         DrawText(device, status.c_str(), -1, &status_bounds, DT_RIGHT | DT_SINGLELINE);
 
-        const RECT bar_bounds{82, top + 42, 312, top + 55};
+        const RECT bar_bounds{scaled(82), top + scaled(34), scaled(312), top + scaled(47)};
         const HBRUSH bar_background = CreateSolidBrush(RGB(11, 13, 17));
         FillRect(device, &bar_bounds, bar_background);
         DeleteObject(bar_background);
 
-        double progress = 1.0;
+        double progress = medication.enabled ? 0.0 : 1.0;
         if (medication.enabled && remaining > std::chrono::minutes::zero() && medication.interval.count() > 0) {
-            progress = 1.0 - static_cast<double>(remaining.count()) / static_cast<double>(medication.interval.count());
+            progress = static_cast<double>(remaining.count()) / static_cast<double>(medication.interval.count());
         }
         RECT progress_bounds = bar_bounds;
-        progress_bounds.right = progress_bounds.left + static_cast<LONG>(230.0 * std::clamp(progress, 0.0, 1.0));
+        progress_bounds.right =
+            progress_bounds.left + static_cast<LONG>(scaled(230) * std::clamp(progress, 0.0, 1.0));
         const HBRUSH progress_brush = CreateSolidBrush(!medication.enabled                               ? RGB(80, 82, 86)
-                                                       : remaining == std::chrono::minutes::zero() ? RGB(49, 145, 83)
-                                                                                                   : RGB(55, 104, 178));
+                                                       : ready ? RGB(49, 145, 83)
+                                                       : soon  ? RGB(190, 119, 31)
+                                                               : RGB(55, 104, 178));
         FillRect(device, &progress_bounds, progress_brush);
         DeleteObject(progress_brush);
+
+        SelectObject(device, widget_font_bold);
+        SetTextColor(device, RGB(239, 242, 247));
+        RECT countdown_bounds = bar_bounds;
+        countdown_bounds.right -= scaled(4);
+        const std::wstring countdown = countdown_text(medication, now);
+        DrawText(
+            device, countdown.c_str(), -1, &countdown_bounds,
+            DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+
+        SelectObject(device, widget_font);
+        SetTextColor(device, RGB(166, 171, 180));
+        RECT timestamp_bounds{scaled(82), top + scaled(52), scaled(312), top + scaled(70)};
+        const std::wstring timestamp = local_timestamp_text(medication, now);
+        DrawText(device, timestamp.c_str(), -1, &timestamp_bounds, DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS);
     }
 
     EndPaint(window, &paint);
@@ -648,7 +764,7 @@ LRESULT CALLBACK window_procedure(const HWND window, const UINT message, const W
         if (point.x == -1 && point.y == -1) {
             RECT bounds{};
             GetWindowRect(window, &bounds);
-            point = POINT{bounds.left + 82, bounds.top + row_top + 20};
+            point = POINT{bounds.left + scaled(82), bounds.top + scaled(row_top + 20)};
         }
 
         const HMENU menu = CreatePopupMenu();
@@ -785,6 +901,12 @@ LRESULT CALLBACK window_procedure(const HWND window, const UINT message, const W
             SendMessage(window, WM_NCLBUTTONDOWN, HTCAPTION, MAKELPARAM(point.x, point.y));
         }
         return 0;
+    case WM_KEYDOWN:
+        if (w_param == VK_APPS || (w_param == VK_F10 && (GetKeyState(VK_SHIFT) & 0x8000))) {
+            SendMessage(window, WM_CONTEXTMENU, reinterpret_cast<WPARAM>(window), static_cast<LPARAM>(-1));
+            return 0;
+        }
+        break;
     case WM_EXITSIZEMOVE:
         persist_window_position(window, true);
         return 0;
@@ -799,6 +921,25 @@ LRESULT CALLBACK window_procedure(const HWND window, const UINT message, const W
                 persist_window_position(window, false);
             }
         }
+        return 0;
+    }
+    case WM_DPICHANGED: {
+        widget_dpi = HIWORD(w_param);
+        while (const HWND child = GetWindow(window, GW_CHILD)) DestroyWindow(child);
+        rebuild_fonts();
+        rebuild_medication_icons();
+        if (!create_taken_buttons(window)) {
+            DestroyWindow(window);
+            return 0;
+        }
+        const auto* suggested = reinterpret_cast<const RECT*>(l_param);
+        const POINT position = clamped_widget_position({suggested->left, suggested->top});
+        SetWindowPos(
+            window, nullptr, position.x, position.y, widget_width(), widget_height(),
+            SWP_NOZORDER | SWP_NOACTIVATE);
+        persist_window_position(window, false);
+        schedule_refresh(window);
+        InvalidateRect(window, nullptr, FALSE);
         return 0;
     }
     case WM_TIMER:
@@ -827,15 +968,20 @@ LRESULT CALLBACK window_procedure(const HWND window, const UINT message, const W
 }
 
 int WINAPI wWinMain(const HINSTANCE instance, HINSTANCE, PWSTR, const int show_command) {
+    enable_per_monitor_dpi();
     const HRESULT com_result = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     struct ComCleanup {
         bool uninitialize;
         ~ComCleanup() {
             clear_medication_icons();
+            if (widget_font) DeleteObject(widget_font);
+            if (widget_font_bold) DeleteObject(widget_font_bold);
             if (imaging_factory) imaging_factory->Release();
             if (uninitialize) CoUninitialize();
         }
     } cleanup{SUCCEEDED(com_result)};
+    widget_dpi = system_dpi();
+    rebuild_fonts();
     if (SUCCEEDED(com_result) || com_result == RPC_E_CHANGED_MODE) {
         CoCreateInstance(
             CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_IWICImagingFactory,
@@ -879,18 +1025,28 @@ int WINAPI wWinMain(const HINSTANCE instance, HINSTANCE, PWSTR, const int show_c
                                        ? clamped_widget_position({*widget_settings.window_x, *widget_settings.window_y})
                                        : POINT{CW_USEDEFAULT, CW_USEDEFAULT};
     const HWND window = CreateWindowEx(
-        WS_EX_TOOLWINDOW | (widget_settings.always_on_top ? WS_EX_TOPMOST : 0), window_class,
-        L"Medication Cooldown Widget", WS_POPUP, initial_position.x, initial_position.y, 420, widget_height(), nullptr,
-        nullptr, instance, nullptr);
+        WS_EX_TOOLWINDOW | WS_EX_CONTROLPARENT | (widget_settings.always_on_top ? WS_EX_TOPMOST : 0), window_class,
+        L"Medication Cooldown Widget", WS_POPUP, initial_position.x, initial_position.y, widget_width(),
+        widget_height(), nullptr, nullptr, instance, nullptr);
     if (!window) return 1;
+
+    const UINT initial_dpi = window_dpi(window);
+    if (initial_dpi != widget_dpi) {
+        widget_dpi = initial_dpi;
+        while (const HWND child = GetWindow(window, GW_CHILD)) DestroyWindow(child);
+        rebuild_fonts();
+        if (!rebuild_widget(window)) return 1;
+    }
 
     ShowWindow(window, show_command);
     schedule_refresh(window);
 
     MSG message{};
     while (GetMessage(&message, nullptr, 0, 0) > 0) {
-        TranslateMessage(&message);
-        DispatchMessage(&message);
+        if (!IsDialogMessage(window, &message)) {
+            TranslateMessage(&message);
+            DispatchMessage(&message);
+        }
     }
     return static_cast<int>(message.wParam);
 }
