@@ -223,7 +223,7 @@ The current build includes:
 - optional local medication icons with native image selection and placeholder fallback
 - per-monitor DPI-aware layout, explicit cooldown state labels, local timestamps, and keyboard navigation
 
-All planned MVP behavior is implemented. Final acceptance is tracked in `MILESTONES.md`.
+MedAuras MVP is complete. The automated, resource-usage, restart/sleep, and full manual acceptance gates passed on 2026-08-13.
 
 ### Build and run in CLion
 

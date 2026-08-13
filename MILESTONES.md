@@ -164,7 +164,7 @@ logic is added.
 
 ## Milestone 5 — Completion and release gate
 
-**Status: Implementation, Release builds/tests, and visible-idle resource verification complete; final manual matrix pending.**
+**Status: Complete — Release builds/tests, resource verification, and the full manual acceptance matrix passed on 2026-08-13.**
 
 ### Outcome
 
