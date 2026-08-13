@@ -1,0 +1,17 @@
+#include <windows.h>
+#include "resource.h"
+
+IDD_MEDICATION_EDITOR DIALOGEX 0, 0, 230, 132
+STYLE DS_SETFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "Medication"
+FONT 9, "Segoe UI"
+BEGIN
+    LTEXT           "Name", -1, 10, 12, 62, 10
+    EDITTEXT        IDC_MEDICATION_NAME, 76, 9, 144, 14, ES_AUTOHSCROLL
+    LTEXT           "Dose", -1, 10, 38, 62, 10
+    EDITTEXT        IDC_MEDICATION_DOSE, 76, 35, 144, 14, ES_AUTOHSCROLL
+    LTEXT           "Interval (minutes)", -1, 10, 64, 64, 18
+    EDITTEXT        IDC_MEDICATION_INTERVAL, 76, 61, 74, 14, ES_AUTOHSCROLL | ES_NUMBER
+    DEFPUSHBUTTON   "Save", IDOK, 112, 104, 50, 16
+    PUSHBUTTON      "Cancel", IDCANCEL, 170, 104, 50, 16
+END

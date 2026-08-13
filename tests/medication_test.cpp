@@ -42,12 +42,18 @@ int main() {
     CHECK(load_medications(json_path).empty());
 
     medication.icon_path = L"icons\\morning.png";
-    medication.name = L"Example \"morning\" medication";
+    medication.name = L"Café \"morning\" medication";
     medication.last_taken_at = std::chrono::sys_days{std::chrono::year{2026} / 8 / 13} + 10h + 30min;
-    save_medications(json_path, std::vector{medication});
+    Medication second{
+        .id = L"evening-medication",
+        .name = L"Evening medication",
+        .dose = L"10 mg",
+        .interval = 24h,
+    };
+    save_medications(json_path, std::vector{medication, second});
 
     const std::vector<Medication> loaded = load_medications(json_path);
-    CHECK(loaded.size() == 1);
+    CHECK(loaded.size() == 2);
     CHECK(loaded[0].id == medication.id);
     CHECK(loaded[0].name == medication.name);
     CHECK(loaded[0].dose == medication.dose);
@@ -55,6 +61,9 @@ int main() {
     CHECK(loaded[0].interval == medication.interval);
     CHECK(loaded[0].last_taken_at == medication.last_taken_at);
     CHECK(loaded[0].enabled == medication.enabled);
+    CHECK(loaded[1].id == second.id);
+    CHECK(!loaded[1].icon_path);
+    CHECK(!loaded[1].last_taken_at);
 
     std::ifstream json(json_path);
     const std::string text{std::istreambuf_iterator<char>{json}, std::istreambuf_iterator<char>{}};
@@ -63,7 +72,7 @@ int main() {
     CHECK(text.find("remaining") == std::string::npos);
 
     medication.dose = L"50 mg";
-    save_medications(json_path, std::vector{medication});
+    save_medications(json_path, std::vector{medication, second});
     CHECK(load_medications(json_path)[0].dose == L"50 mg");
     CHECK(!std::filesystem::exists(json_path.wstring() + L".tmp"));
     std::filesystem::remove(json_path);
