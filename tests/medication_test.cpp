@@ -43,7 +43,10 @@ int main() {
 
     const std::filesystem::path json_path = std::filesystem::temp_directory_path() / "med-auras-storage-test.json";
     std::filesystem::remove(json_path);
-    CHECK(load_medications(json_path).empty());
+    WidgetSettings settings;
+    CHECK(load_medications(json_path, &settings).empty());
+    CHECK(!settings.window_x);
+    CHECK(!settings.window_y);
 
     medication.icon_path = L"icons\\morning.png";
     medication.name = L"Café \"morning\" medication";
@@ -54,9 +57,16 @@ int main() {
         .dose = L"10 mg",
         .interval = 24h,
     };
-    save_medications(json_path, std::vector{medication, second});
+    settings = {
+        .window_x = -200,
+        .window_y = 150,
+        .position_locked = true,
+        .always_on_top = true,
+    };
+    save_medications(json_path, std::vector{medication, second}, settings);
 
-    const std::vector<Medication> loaded = load_medications(json_path);
+    WidgetSettings loaded_settings;
+    const std::vector<Medication> loaded = load_medications(json_path, &loaded_settings);
     CHECK(loaded.size() == 2);
     CHECK(loaded[0].id == medication.id);
     CHECK(loaded[0].name == medication.name);
@@ -68,6 +78,10 @@ int main() {
     CHECK(loaded[1].id == second.id);
     CHECK(!loaded[1].icon_path);
     CHECK(!loaded[1].last_taken_at);
+    CHECK(loaded_settings.window_x == settings.window_x);
+    CHECK(loaded_settings.window_y == settings.window_y);
+    CHECK(loaded_settings.position_locked);
+    CHECK(loaded_settings.always_on_top);
 
     std::ifstream json(json_path);
     const std::string text{std::istreambuf_iterator<char>{json}, std::istreambuf_iterator<char>{}};
@@ -76,8 +90,18 @@ int main() {
     CHECK(text.find("remaining") == std::string::npos);
 
     medication.dose = L"50 mg";
-    save_medications(json_path, std::vector{medication, second});
+    save_medications(json_path, std::vector{medication, second}, settings);
     CHECK(load_medications(json_path)[0].dose == L"50 mg");
     CHECK(!std::filesystem::exists(json_path.wstring() + L".tmp"));
+
+    std::ofstream legacy(json_path, std::ios::trunc);
+    legacy << "{\"medications\": []}\n";
+    legacy.close();
+    loaded_settings = settings;
+    CHECK(load_medications(json_path, &loaded_settings).empty());
+    CHECK(!loaded_settings.window_x);
+    CHECK(!loaded_settings.window_y);
+    CHECK(!loaded_settings.position_locked);
+    CHECK(!loaded_settings.always_on_top);
     std::filesystem::remove(json_path);
 }

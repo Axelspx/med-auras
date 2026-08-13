@@ -217,9 +217,11 @@ The current build includes:
 - add/edit with start date/time and minute/hour/day/week interval units
 - right-click pause/resume and confirmed removal
 - automatic current-user Windows sign-in startup after initial configuration
+- system-tray show/hide, startup toggle, and exit controls
+- widget dragging with restorable on-screen position
+- persistent position locking and always-on-top controls
 
-Not yet implemented: system-tray show/hide, widget dragging and position restoration, position locking, always-on-top,
-medication icon selection/rendering, and final visual polish.
+Not yet implemented: medication icon selection/rendering and final visual polish.
 
 ### Build and run in CLion
 

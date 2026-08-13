@@ -9,7 +9,7 @@ add_executable(med-auras WIN32
     src/resources.rc
 )
 target_compile_features(med-auras PRIVATE cxx_std_20)
-target_compile_definitions(med-auras PRIVATE UNICODE _UNICODE)
+target_compile_definitions(med-auras PRIVATE UNICODE _UNICODE NOMINMAX)
 target_link_libraries(med-auras PRIVATE Advapi32 Comctl32 Shell32 Ole32)
 
 if(MSVC)
@@ -26,6 +26,7 @@ if(BUILD_TESTING)
         src/storage.cpp
     )
     target_compile_features(medication-test PRIVATE cxx_std_20)
+    target_compile_definitions(medication-test PRIVATE NOMINMAX)
     target_include_directories(medication-test PRIVATE src)
 
     if(MSVC)

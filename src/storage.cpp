@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <fstream>
 #include <iomanip>
+#include <limits>
 #include <map>
 #include <sstream>
 #include <stdexcept>
@@ -332,9 +333,24 @@ Medication medication_from_json(const JsonValue& value) {
     }
     return medication;
 }
+
+int setting_integer(const JsonValue::Object& object, const char* name) {
+    const std::int64_t value = as<std::int64_t>(required(object, name), name);
+    if (value < std::numeric_limits<int>::min() || value > std::numeric_limits<int>::max()) {
+        throw std::runtime_error(std::string{"Medication JSON setting '"} + name + "' is out of range");
+    }
+    return static_cast<int>(value);
 }
 
-std::vector<Medication> load_medications(const std::filesystem::path& path) {
+std::optional<int> optional_setting_integer(const JsonValue::Object& object, const char* name) {
+    const JsonValue& value = required(object, name);
+    if (std::holds_alternative<std::nullptr_t>(value.value)) return std::nullopt;
+    return setting_integer(object, name);
+}
+}
+
+std::vector<Medication> load_medications(const std::filesystem::path& path, WidgetSettings* settings) {
+    if (settings) *settings = {};
     std::ifstream input(path, std::ios::binary);
     if (!input) {
         if (!std::filesystem::exists(path)) return {};
@@ -343,6 +359,15 @@ std::vector<Medication> load_medications(const std::filesystem::path& path) {
     const std::string contents{std::istreambuf_iterator<char>{input}, std::istreambuf_iterator<char>{}};
     const JsonValue document = JsonParser{contents}.parse();
     const auto& root = as<JsonValue::Object>(document, "root");
+    if (settings) {
+        if (const auto found = root.find("settings"); found != root.end()) {
+            const auto& object = as<JsonValue::Object>(found->second, "settings");
+            settings->window_x = optional_setting_integer(object, "window_x");
+            settings->window_y = optional_setting_integer(object, "window_y");
+            settings->position_locked = as<bool>(required(object, "position_locked"), "position_locked");
+            settings->always_on_top = as<bool>(required(object, "always_on_top"), "always_on_top");
+        }
+    }
     const auto& values = as<JsonValue::Array>(required(root, "medications"), "medications");
     std::vector<Medication> medications;
     medications.reserve(values.size());
@@ -350,7 +375,9 @@ std::vector<Medication> load_medications(const std::filesystem::path& path) {
     return medications;
 }
 
-void save_medications(const std::filesystem::path& path, const std::span<const Medication> medications) {
+void save_medications(
+    const std::filesystem::path& path, const std::span<const Medication> medications,
+    const WidgetSettings& settings) {
     if (!path.parent_path().empty()) std::filesystem::create_directories(path.parent_path());
     std::filesystem::path temporary = path;
     temporary += L".tmp";
@@ -374,7 +401,15 @@ void save_medications(const std::filesystem::path& path, const std::span<const M
         else output << "null";
         output << ",\n      \"enabled\": " << (medication.enabled ? "true" : "false") << "\n    }";
     }
-    output << (medications.empty() ? "]\n}\n" : "\n  ]\n}\n");
+    output << (medications.empty() ? "]" : "\n  ]") << ",\n  \"settings\": {\n" << "    \"window_x\": ";
+    if (settings.window_x) output << *settings.window_x;
+    else output << "null";
+    output << ",\n    \"window_y\": ";
+    if (settings.window_y) output << *settings.window_y;
+    else output << "null";
+    output << ",\n    \"position_locked\": " << (settings.position_locked ? "true" : "false") << ",\n"
+           << "    \"always_on_top\": " << (settings.always_on_top ? "true" : "false") << "\n"
+           << "  }\n}\n";
     output.flush();
     if (!output) {
         output.close();

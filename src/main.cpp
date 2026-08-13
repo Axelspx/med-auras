@@ -31,6 +31,8 @@ constexpr UINT toggle_paused_command = 1;
 constexpr UINT remove_medication_command = 2;
 constexpr UINT edit_medication_command = 3;
 constexpr UINT add_medication_command = 4;
+constexpr UINT lock_position_command = 5;
+constexpr UINT always_on_top_command = 6;
 constexpr UINT tray_show_hide_command = 10;
 constexpr UINT tray_startup_command = 11;
 constexpr UINT tray_exit_command = 12;
@@ -39,6 +41,7 @@ constexpr UINT tray_icon_id = 1;
 
 std::vector<Medication> medications;
 std::filesystem::path medications_path;
+WidgetSettings widget_settings;
 bool enable_startup_after_save{};
 bool tray_icon_added{};
 UINT taskbar_created_message{};
@@ -244,6 +247,10 @@ void schedule_refresh(const HWND window) {
     }
 }
 
+void save_state() {
+    save_medications(medications_path, medications, widget_settings);
+}
+
 NOTIFYICONDATA tray_icon_data(const HWND window) {
     NOTIFYICONDATA data{sizeof(NOTIFYICONDATA)};
     data.hWnd = window;
@@ -274,6 +281,45 @@ void show_widget(const HWND window) {
     SetForegroundWindow(window);
     schedule_refresh(window);
     InvalidateRect(window, nullptr, FALSE);
+}
+
+POINT clamped_widget_position(const POINT position) {
+    const HMONITOR monitor = MonitorFromPoint(position, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO info{sizeof(MONITORINFO)};
+    if (!monitor || !GetMonitorInfo(monitor, &info)) return position;
+    return POINT{
+        std::clamp(position.x, info.rcWork.left, std::max(info.rcWork.left, info.rcWork.right - 420)),
+        std::clamp(position.y, info.rcWork.top, std::max(info.rcWork.top, info.rcWork.bottom - widget_height())),
+    };
+}
+
+void apply_topmost(const HWND window) {
+    SetWindowPos(
+        window, widget_settings.always_on_top ? HWND_TOPMOST : HWND_NOTOPMOST, 0, 0, 0, 0,
+        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+}
+
+void persist_window_position(const HWND window, const bool restore_on_failure) {
+    RECT bounds{};
+    if (!GetWindowRect(window, &bounds)) return;
+    const auto previous_x = widget_settings.window_x;
+    const auto previous_y = widget_settings.window_y;
+    widget_settings.window_x = bounds.left;
+    widget_settings.window_y = bounds.top;
+    try {
+        save_state();
+    } catch (const std::exception&) {
+        widget_settings.window_x = previous_x;
+        widget_settings.window_y = previous_y;
+        if (restore_on_failure && previous_x && previous_y) {
+            SetWindowPos(
+                window, nullptr, *previous_x, *previous_y, 0, 0,
+                SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+        MessageBox(
+            window, L"The widget position could not be saved.", L"Medication Cooldown Widget",
+            MB_OK | MB_ICONERROR);
+    }
 }
 
 void show_tray_menu(const HWND window, const POINT point) {
@@ -345,6 +391,16 @@ bool rebuild_widget(const HWND window) {
     if (!create_taken_buttons(window)) return false;
     SetWindowPos(
         window, nullptr, 0, 0, 420, widget_height(), SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+    RECT bounds{};
+    if (GetWindowRect(window, &bounds)) {
+        const POINT clamped = clamped_widget_position({bounds.left, bounds.top});
+        if (clamped.x != bounds.left || clamped.y != bounds.top) {
+            SetWindowPos(
+                window, nullptr, clamped.x, clamped.y, 0, 0,
+                SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+            persist_window_position(window, false);
+        }
+    }
     schedule_refresh(window);
     InvalidateRect(window, nullptr, FALSE);
     return true;
@@ -452,7 +508,7 @@ LRESULT CALLBACK window_procedure(const HWND window, const UINT message, const W
             const auto previous = medication.last_taken_at;
             medication.mark_taken(std::chrono::system_clock::now());
             try {
-                save_medications(medications_path, medications);
+                save_state();
                 enable_startup_if_needed(window);
             } catch (const std::exception&) {
                 medication.last_taken_at = previous;
@@ -486,6 +542,13 @@ LRESULT CALLBACK window_procedure(const HWND window, const UINT message, const W
             AppendMenu(menu, MF_SEPARATOR, 0, nullptr);
         }
         AppendMenu(menu, MF_STRING, add_medication_command, L"Add medication...");
+        AppendMenu(menu, MF_SEPARATOR, 0, nullptr);
+        AppendMenu(
+            menu, MF_STRING | (widget_settings.position_locked ? MF_CHECKED : MF_UNCHECKED),
+            lock_position_command, L"Lock position");
+        AppendMenu(
+            menu, MF_STRING | (widget_settings.always_on_top ? MF_CHECKED : MF_UNCHECKED),
+            always_on_top_command, L"Always on top");
         SetForegroundWindow(window);
         const UINT command = TrackPopupMenu(
             menu, TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON, point.x, point.y, 0, window, nullptr);
@@ -496,7 +559,7 @@ LRESULT CALLBACK window_procedure(const HWND window, const UINT message, const W
                 const Medication previous = medications[*index];
                 medications[*index] = std::move(edited);
                 try {
-                    save_medications(medications_path, medications);
+                    save_state();
                     enable_startup_if_needed(window);
                 } catch (const std::exception&) {
                     medications[*index] = previous;
@@ -513,7 +576,7 @@ LRESULT CALLBACK window_procedure(const HWND window, const UINT message, const W
                 added.id = new_medication_id();
                 medications.push_back(std::move(added));
                 try {
-                    save_medications(medications_path, medications);
+                    save_state();
                     enable_startup_if_needed(window);
                 } catch (const std::exception&) {
                     medications.pop_back();
@@ -528,7 +591,7 @@ LRESULT CALLBACK window_procedure(const HWND window, const UINT message, const W
             Medication& medication = medications[*index];
             medication.enabled = !medication.enabled;
             try {
-                save_medications(medications_path, medications);
+                save_state();
                 enable_startup_if_needed(window);
             } catch (const std::exception&) {
                 medication.enabled = !medication.enabled;
@@ -547,7 +610,7 @@ LRESULT CALLBACK window_procedure(const HWND window, const UINT message, const W
                 const Medication removed = medications[*index];
                 medications.erase(medications.begin() + static_cast<std::ptrdiff_t>(*index));
                 try {
-                    save_medications(medications_path, medications);
+                    save_state();
                     enable_startup_if_needed(window);
                 } catch (const std::exception&) {
                     medications.insert(
@@ -565,6 +628,55 @@ LRESULT CALLBACK window_procedure(const HWND window, const UINT message, const W
                     DestroyWindow(window);
                     return 0;
                 }
+            }
+        } else if (command == lock_position_command) {
+            widget_settings.position_locked = !widget_settings.position_locked;
+            try {
+                save_state();
+            } catch (const std::exception&) {
+                widget_settings.position_locked = !widget_settings.position_locked;
+                MessageBox(
+                    window, L"The position lock setting could not be saved.", L"Medication Cooldown Widget",
+                    MB_OK | MB_ICONERROR);
+            }
+        } else if (command == always_on_top_command) {
+            widget_settings.always_on_top = !widget_settings.always_on_top;
+            apply_topmost(window);
+            try {
+                save_state();
+            } catch (const std::exception&) {
+                widget_settings.always_on_top = !widget_settings.always_on_top;
+                apply_topmost(window);
+                MessageBox(
+                    window, L"The always-on-top setting could not be saved.", L"Medication Cooldown Widget",
+                    MB_OK | MB_ICONERROR);
+            }
+        }
+        return 0;
+    }
+    case WM_LBUTTONDOWN:
+        if (!widget_settings.position_locked) {
+            POINT point{
+                static_cast<LONG>(static_cast<short>(LOWORD(l_param))),
+                static_cast<LONG>(static_cast<short>(HIWORD(l_param))),
+            };
+            ClientToScreen(window, &point);
+            ReleaseCapture();
+            SendMessage(window, WM_NCLBUTTONDOWN, HTCAPTION, MAKELPARAM(point.x, point.y));
+        }
+        return 0;
+    case WM_EXITSIZEMOVE:
+        persist_window_position(window, true);
+        return 0;
+    case WM_DISPLAYCHANGE: {
+        RECT bounds{};
+        if (GetWindowRect(window, &bounds)) {
+            const POINT clamped = clamped_widget_position({bounds.left, bounds.top});
+            if (clamped.x != bounds.left || clamped.y != bounds.top) {
+                SetWindowPos(
+                    window, nullptr, clamped.x, clamped.y, 0, 0,
+                    SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+                persist_window_position(window, false);
             }
         }
         return 0;
@@ -601,7 +713,7 @@ int WINAPI wWinMain(const HINSTANCE instance, HINSTANCE, PWSTR, const int show_c
     try {
         medications_path = local_medications_path();
         configuration_missing = !std::filesystem::exists(medications_path);
-        medications = load_medications(medications_path);
+        medications = load_medications(medications_path, &widget_settings);
         enable_startup_after_save = configuration_missing;
     } catch (const std::exception&) {
         MessageBox(nullptr, L"Saved medications could not be loaded.", L"Medication Cooldown Widget", MB_OK | MB_ICONERROR);
@@ -625,9 +737,14 @@ int WINAPI wWinMain(const HINSTANCE instance, HINSTANCE, PWSTR, const int show_c
     };
     if (!RegisterClass(&window_definition)) return 1;
 
+    const bool has_saved_position = widget_settings.window_x && widget_settings.window_y;
+    const POINT initial_position = has_saved_position
+                                       ? clamped_widget_position({*widget_settings.window_x, *widget_settings.window_y})
+                                       : POINT{CW_USEDEFAULT, CW_USEDEFAULT};
     const HWND window = CreateWindowEx(
-        WS_EX_TOOLWINDOW, window_class, L"Medication Cooldown Widget", WS_POPUP, CW_USEDEFAULT, CW_USEDEFAULT, 420,
-        widget_height(), nullptr, nullptr, instance, nullptr);
+        WS_EX_TOOLWINDOW | (widget_settings.always_on_top ? WS_EX_TOPMOST : 0), window_class,
+        L"Medication Cooldown Widget", WS_POPUP, initial_position.x, initial_position.y, 420, widget_height(), nullptr,
+        nullptr, instance, nullptr);
     if (!window) return 1;
 
     ShowWindow(window, show_command);

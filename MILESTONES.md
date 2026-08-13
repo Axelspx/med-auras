@@ -18,6 +18,8 @@ makes one additional source file clearer than keeping it in `main.cpp`.
 
 ## Milestone 1 — Tray lifecycle and user-controlled startup
 
+**Status: Complete — automated builds/tests and manual interaction acceptance passed on 2026-08-13.**
+
 ### Outcome
 
 MedAuras can remain available without occupying the desktop, and the user can show or hide it, disable or re-enable
@@ -52,6 +54,8 @@ Window dragging/position state, always-on-top, medication images, and cosmetic c
 service, scheduled task, installer, or background helper is introduced.
 
 ## Milestone 2 — Restorable placement and window controls
+
+**Status: Implementation and automated verification complete; manual interaction acceptance pending.**
 
 ### Outcome
 
