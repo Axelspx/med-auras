@@ -4,6 +4,7 @@
 
 #include <windows.h>
 #include <commctrl.h>
+#include <shellapi.h>
 #include <shlobj.h>
 
 #include <algorithm>
@@ -30,10 +31,17 @@ constexpr UINT toggle_paused_command = 1;
 constexpr UINT remove_medication_command = 2;
 constexpr UINT edit_medication_command = 3;
 constexpr UINT add_medication_command = 4;
+constexpr UINT tray_show_hide_command = 10;
+constexpr UINT tray_startup_command = 11;
+constexpr UINT tray_exit_command = 12;
+constexpr UINT tray_callback_message = WM_APP + 1;
+constexpr UINT tray_icon_id = 1;
 
 std::vector<Medication> medications;
 std::filesystem::path medications_path;
 bool enable_startup_after_save{};
+bool tray_icon_added{};
+UINT taskbar_created_message{};
 
 std::filesystem::path local_medications_path() {
     PWSTR local_app_data{};
@@ -227,11 +235,81 @@ std::wstring remaining_text(const Medication& medication, const std::chrono::sys
 
 void schedule_refresh(const HWND window) {
     KillTimer(window, refresh_timer);
+    if (!IsWindowVisible(window)) return;
     const auto now = std::chrono::system_clock::now();
     if (std::ranges::any_of(medications, [now](const Medication& medication) {
             return medication.enabled && medication.remaining_at(now) > std::chrono::minutes::zero();
         })) {
         SetTimer(window, refresh_timer, 60'000, nullptr);
+    }
+}
+
+NOTIFYICONDATA tray_icon_data(const HWND window) {
+    NOTIFYICONDATA data{sizeof(NOTIFYICONDATA)};
+    data.hWnd = window;
+    data.uID = tray_icon_id;
+    data.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
+    data.uCallbackMessage = tray_callback_message;
+    data.hIcon = LoadIcon(nullptr, IDI_APPLICATION);
+    std::copy_n(L"MedAuras", 9, data.szTip);
+    return data;
+}
+
+bool add_tray_icon(const HWND window) {
+    if (tray_icon_added) return true;
+    NOTIFYICONDATA data = tray_icon_data(window);
+    tray_icon_added = Shell_NotifyIcon(NIM_ADD, &data) != FALSE;
+    return tray_icon_added;
+}
+
+void remove_tray_icon(const HWND window) {
+    if (!tray_icon_added) return;
+    NOTIFYICONDATA data = tray_icon_data(window);
+    Shell_NotifyIcon(NIM_DELETE, &data);
+    tray_icon_added = false;
+}
+
+void show_widget(const HWND window) {
+    ShowWindow(window, SW_SHOWNORMAL);
+    SetForegroundWindow(window);
+    schedule_refresh(window);
+    InvalidateRect(window, nullptr, FALSE);
+}
+
+void show_tray_menu(const HWND window, const POINT point) {
+    const HMENU menu = CreatePopupMenu();
+    if (!menu) return;
+    AppendMenu(menu, MF_STRING, tray_show_hide_command, IsWindowVisible(window) ? L"Hide" : L"Show");
+    AppendMenu(
+        menu, MF_STRING | (is_startup_enabled() ? MF_CHECKED : MF_UNCHECKED), tray_startup_command,
+        L"Start with Windows");
+    AppendMenu(menu, MF_SEPARATOR, 0, nullptr);
+    AppendMenu(menu, MF_STRING, tray_exit_command, L"Exit");
+
+    SetForegroundWindow(window);
+    const UINT command = TrackPopupMenu(
+        menu, TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON, point.x, point.y, 0, window, nullptr);
+    DestroyMenu(menu);
+    PostMessage(window, WM_NULL, 0, 0);
+
+    if (command == tray_show_hide_command) {
+        if (IsWindowVisible(window)) {
+            ShowWindow(window, SW_HIDE);
+            KillTimer(window, refresh_timer);
+        } else {
+            show_widget(window);
+        }
+    } else if (command == tray_startup_command) {
+        const bool enabled = is_startup_enabled();
+        if (enabled ? disable_startup() : enable_startup()) {
+            enable_startup_after_save = false;
+        } else {
+            MessageBox(
+                window, enabled ? L"Windows startup could not be disabled." : L"Windows startup could not be enabled.",
+                L"Medication Cooldown Widget", MB_OK | MB_ICONERROR);
+        }
+    } else if (command == tray_exit_command) {
+        DestroyWindow(window);
     }
 }
 
@@ -340,9 +418,33 @@ void paint_widget(const HWND window) {
 }
 
 LRESULT CALLBACK window_procedure(const HWND window, const UINT message, const WPARAM w_param, const LPARAM l_param) {
+    if (message == taskbar_created_message) {
+        tray_icon_added = false;
+        if (!add_tray_icon(window)) {
+            MessageBox(
+                window, L"The system tray icon could not be restored.", L"Medication Cooldown Widget",
+                MB_OK | MB_ICONWARNING);
+        }
+        return 0;
+    }
+
     switch (message) {
     case WM_CREATE:
-        return create_taken_buttons(window) ? 0 : -1;
+        if (!create_taken_buttons(window)) return -1;
+        if (!add_tray_icon(window)) {
+            MessageBox(
+                window, L"The system tray icon could not be created.", L"Medication Cooldown Widget",
+                MB_OK | MB_ICONWARNING);
+        }
+        return 0;
+    case tray_callback_message:
+        if (l_param == WM_LBUTTONDBLCLK) {
+            show_widget(window);
+        } else if (l_param == WM_RBUTTONUP || l_param == WM_CONTEXTMENU) {
+            POINT point{};
+            if (GetCursorPos(&point)) show_tray_menu(window, point);
+        }
+        return 0;
     case WM_COMMAND: {
         const int index = LOWORD(w_param) - first_taken_button_id;
         if (HIWORD(w_param) == BN_CLICKED && index >= 0 && static_cast<std::size_t>(index) < medications.size()) {
@@ -481,6 +583,7 @@ LRESULT CALLBACK window_procedure(const HWND window, const UINT message, const W
         return 1;
     case WM_DESTROY:
         KillTimer(window, refresh_timer);
+        remove_tray_icon(window);
         PostQuitMessage(0);
         return 0;
     default:
@@ -499,12 +602,20 @@ int WINAPI wWinMain(const HINSTANCE instance, HINSTANCE, PWSTR, const int show_c
         medications_path = local_medications_path();
         configuration_missing = !std::filesystem::exists(medications_path);
         medications = load_medications(medications_path);
-        enable_startup_after_save = configuration_missing || medications.empty();
+        enable_startup_after_save = configuration_missing;
     } catch (const std::exception&) {
         MessageBox(nullptr, L"Saved medications could not be loaded.", L"Medication Cooldown Widget", MB_OK | MB_ICONERROR);
         return 1;
     }
     if (medications.empty() && configuration_missing) medications.push_back(example_medication());
+
+    taskbar_created_message = RegisterWindowMessage(L"TaskbarCreated");
+    if (taskbar_created_message == 0) {
+        MessageBox(
+            nullptr, L"System tray integration could not be initialized.", L"Medication Cooldown Widget",
+            MB_OK | MB_ICONERROR);
+        return 1;
+    }
 
     const WNDCLASS window_definition{
         .lpfnWndProc = window_procedure,
