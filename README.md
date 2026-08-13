@@ -128,6 +128,11 @@ Each medication should support:
 - next-available timestamp derived from stored state
 - enabled/paused state
 
+When adding or editing a medication, the user chooses a start date/time (defaulting to now), an interval value, and
+minutes, hours, days, or weeks as the unit. Fractional intervals are supported when they resolve to at least one whole
+minute. For example, `3.5 days` becomes `5040` stored minutes. The selected start is the initial timer anchor; clicking
+**Taken** later replaces it with the actual click time.
+
 ### Cooldown bars
 
 Each medication row should:
@@ -198,6 +203,33 @@ Suggested data shape:
     }
   ]
 }
+```
+
+Timestamps are stored as UTC. The editor displays and accepts local Windows date/time values.
+
+## Current Development Build
+
+The current build includes:
+
+- compact stacked cooldown rows
+- `READY`, active countdown, and paused states
+- immediate persistence when **Taken** is clicked
+- add/edit with start date/time and minute/hour/day/week interval units
+- right-click pause/resume and confirmed removal
+- automatic current-user Windows sign-in startup after initial configuration
+
+Not yet implemented: system-tray show/hide, widget dragging and position restoration, position locking, always-on-top,
+medication icon selection/rendering, and final visual polish.
+
+### Build and run in CLion
+
+Open this repository as a CMake project, reload CMake, select the `med-auras` CMake target, and run it. Both MSVC and
+CLion's bundled MinGW toolchain are supported. The automated executable is the separate `medication-test` target.
+
+Medication data is stored at:
+
+```text
+%LOCALAPPDATA%\MedAuras\medications.json
 ```
 
 ## Status Styling

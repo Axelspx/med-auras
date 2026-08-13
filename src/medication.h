@@ -4,6 +4,15 @@
 #include <optional>
 #include <string>
 
+enum class IntervalUnit {
+    minutes,
+    hours,
+    days,
+    weeks,
+};
+
+[[nodiscard]] std::optional<std::chrono::minutes> interval_in_minutes(double value, IntervalUnit unit);
+
 struct Medication {
     std::wstring id;
     std::wstring name;

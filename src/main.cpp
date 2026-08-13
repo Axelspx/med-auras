@@ -3,6 +3,7 @@
 #include "startup.h"
 
 #include <windows.h>
+#include <commctrl.h>
 #include <shlobj.h>
 
 #include <algorithm>
@@ -10,7 +11,9 @@
 #include <chrono>
 #include <cwchar>
 #include <filesystem>
+#include <iomanip>
 #include <optional>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -67,6 +70,66 @@ void enable_startup_if_needed(const HWND window) {
     }
 }
 
+std::chrono::system_clock::time_point system_time_to_time_point(const SYSTEMTIME& value) {
+    const std::chrono::year_month_day date{
+        std::chrono::year{value.wYear}, std::chrono::month{value.wMonth}, std::chrono::day{value.wDay}};
+    return std::chrono::sys_days{date} + std::chrono::hours{value.wHour} + std::chrono::minutes{value.wMinute} +
+           std::chrono::seconds{value.wSecond};
+}
+
+SYSTEMTIME time_point_to_system_time(const std::chrono::system_clock::time_point value) {
+    const auto seconds = std::chrono::floor<std::chrono::seconds>(value);
+    const auto day = std::chrono::floor<std::chrono::days>(seconds);
+    const std::chrono::year_month_day date{day};
+    const std::chrono::hh_mm_ss time{seconds - day};
+    return SYSTEMTIME{
+        .wYear = static_cast<WORD>(static_cast<int>(date.year())),
+        .wMonth = static_cast<WORD>(static_cast<unsigned>(date.month())),
+        .wDayOfWeek = static_cast<WORD>(std::chrono::weekday{day}.c_encoding()),
+        .wDay = static_cast<WORD>(static_cast<unsigned>(date.day())),
+        .wHour = static_cast<WORD>(time.hours().count()),
+        .wMinute = static_cast<WORD>(time.minutes().count()),
+        .wSecond = static_cast<WORD>(time.seconds().count()),
+    };
+}
+
+SYSTEMTIME local_time_for(const std::chrono::system_clock::time_point value) {
+    const SYSTEMTIME utc = time_point_to_system_time(value);
+    SYSTEMTIME local{};
+    return SystemTimeToTzSpecificLocalTime(nullptr, &utc, &local) ? local : utc;
+}
+
+std::optional<std::chrono::system_clock::time_point> utc_time_for(const SYSTEMTIME& local) {
+    SYSTEMTIME utc{};
+    if (!TzSpecificLocalTimeToSystemTime(nullptr, &local, &utc)) return std::nullopt;
+    return system_time_to_time_point(utc);
+}
+
+struct DisplayInterval {
+    double value;
+    IntervalUnit unit;
+};
+
+DisplayInterval display_interval(const std::chrono::minutes interval) {
+    const auto minutes = interval.count();
+    if (minutes >= 10'080 && minutes % 5'040 == 0) {
+        return {static_cast<double>(minutes) / 10'080.0, IntervalUnit::weeks};
+    }
+    if (minutes >= 1'440 && minutes % 720 == 0) {
+        return {static_cast<double>(minutes) / 1'440.0, IntervalUnit::days};
+    }
+    if (minutes >= 60 && minutes % 30 == 0) {
+        return {static_cast<double>(minutes) / 60.0, IntervalUnit::hours};
+    }
+    return {static_cast<double>(minutes), IntervalUnit::minutes};
+}
+
+std::wstring interval_text(const double value) {
+    std::wostringstream output;
+    output << std::setprecision(10) << value;
+    return output.str();
+}
+
 INT_PTR CALLBACK medication_editor_procedure(
     const HWND dialog, const UINT message, const WPARAM w_param, const LPARAM l_param) {
     if (message == WM_INITDIALOG) {
@@ -75,8 +138,18 @@ INT_PTR CALLBACK medication_editor_procedure(
         SetWindowText(dialog, medication->id.empty() ? L"Add medication" : L"Edit medication");
         SetDlgItemText(dialog, IDC_MEDICATION_NAME, medication->name.c_str());
         SetDlgItemText(dialog, IDC_MEDICATION_DOSE, medication->dose.c_str());
-        SetDlgItemText(
-            dialog, IDC_MEDICATION_INTERVAL, std::to_wstring(medication->interval.count()).c_str());
+        const DisplayInterval displayed = display_interval(medication->interval);
+        SetDlgItemText(dialog, IDC_MEDICATION_INTERVAL, interval_text(displayed.value).c_str());
+        const HWND unit = GetDlgItem(dialog, IDC_MEDICATION_UNIT);
+        for (const wchar_t* label : {L"minutes", L"hours", L"days", L"weeks"}) {
+            SendMessage(unit, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(label));
+        }
+        SendMessage(unit, CB_SETCURSEL, static_cast<WPARAM>(displayed.unit), 0);
+
+        const SYSTEMTIME start = local_time_for(
+            medication->last_taken_at.value_or(std::chrono::system_clock::now()));
+        DateTime_SetSystemtime(GetDlgItem(dialog, IDC_MEDICATION_DATE), GDT_VALID, &start);
+        DateTime_SetSystemtime(GetDlgItem(dialog, IDC_MEDICATION_TIME), GDT_VALID, &start);
         SetFocus(GetDlgItem(dialog, IDC_MEDICATION_NAME));
         return FALSE;
     }
@@ -97,17 +170,31 @@ INT_PTR CALLBACK medication_editor_procedure(
         dialog, IDC_MEDICATION_INTERVAL, interval_text.data(), static_cast<int>(interval_text.size()));
 
     wchar_t* interval_end{};
-    const long long interval = std::wcstoll(interval_text.data(), &interval_end, 10);
-    if (name[0] == L'\0' || interval <= 0 || interval_end == interval_text.data() || *interval_end != L'\0') {
+    const double interval_value = std::wcstod(interval_text.data(), &interval_end);
+    const LRESULT selected_unit = SendDlgItemMessage(dialog, IDC_MEDICATION_UNIT, CB_GETCURSEL, 0, 0);
+    const auto interval = selected_unit >= 0 && selected_unit <= static_cast<LRESULT>(IntervalUnit::weeks)
+                              ? interval_in_minutes(interval_value, static_cast<IntervalUnit>(selected_unit))
+                              : std::nullopt;
+    SYSTEMTIME date{};
+    SYSTEMTIME time{};
+    DateTime_GetSystemtime(GetDlgItem(dialog, IDC_MEDICATION_DATE), &date);
+    DateTime_GetSystemtime(GetDlgItem(dialog, IDC_MEDICATION_TIME), &time);
+    date.wHour = time.wHour;
+    date.wMinute = time.wMinute;
+    date.wSecond = 0;
+    date.wMilliseconds = 0;
+    const auto start = utc_time_for(date);
+    if (name[0] == L'\0' || !interval || !start || interval_end == interval_text.data() || *interval_end != L'\0') {
         MessageBox(
-            dialog, L"Enter a medication name and a positive interval in minutes.", L"Medication",
+            dialog, L"Enter a medication name, positive interval, unit, and valid start date/time.", L"Medication",
             MB_OK | MB_ICONWARNING);
         return TRUE;
     }
 
     medication->name = name.data();
     medication->dose = dose.data();
-    medication->interval = std::chrono::minutes{interval};
+    medication->interval = *interval;
+    medication->last_taken_at = *start;
     EndDialog(dialog, IDOK);
     return TRUE;
 }
@@ -404,6 +491,9 @@ LRESULT CALLBACK window_procedure(const HWND window, const UINT message, const W
 }
 
 int WINAPI wWinMain(const HINSTANCE instance, HINSTANCE, PWSTR, const int show_command) {
+    const INITCOMMONCONTROLSEX common_controls{sizeof(INITCOMMONCONTROLSEX), ICC_DATE_CLASSES};
+    if (!InitCommonControlsEx(&common_controls)) return 1;
+
     bool configuration_missing{};
     try {
         medications_path = local_medications_path();

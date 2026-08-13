@@ -18,6 +18,10 @@
 int main() {
     using namespace std::chrono_literals;
 
+    CHECK(interval_in_minutes(3.5, IntervalUnit::days) == 5'040min);
+    CHECK(interval_in_minutes(2.0, IntervalUnit::weeks) == 20'160min);
+    CHECK(!interval_in_minutes(0.0, IntervalUnit::hours));
+
     Medication medication{
         .id = L"morning-medication",
         .name = L"Example medication",

@@ -60,18 +60,22 @@ Store facts, not continuously changing countdown state.
 Example:
 
 ```text
-last_taken_at
+timer_anchor_at
 interval_minutes
 ```
 
 Derive:
 
 ```text
-next_available_at = last_taken_at + interval
+next_available_at = timer_anchor_at + interval
 remaining = next_available_at - now
 ```
 
 Never persist a value such as `remaining_seconds`.
+
+For a newly configured medication, the user-selected start date/time is the initial timer anchor and defaults to the
+current local date/time. After the user clicks **Taken**, that click timestamp becomes the new anchor. Store timestamps
+in UTC and present/edit them in local time.
 
 ## MVP Scope
 
@@ -88,6 +92,9 @@ Each medication needs:
 - interval in minutes
 - last-taken timestamp
 - enabled/paused state
+
+The editor may accept fractional intervals in minutes, hours, days, or weeks, but must normalize them to a positive
+whole-minute value for the model and JSON. For example, `3.5 days` is stored as `5040` minutes.
 
 ### Main widget
 
@@ -262,6 +269,13 @@ Unless explicitly reordered, work in this general sequence:
 12. Polish and resource-usage verification
 
 Do not jump into non-MVP features before the core widget works reliably.
+
+## Current Implementation State
+
+Implemented: native borderless widget, timestamp-derived cooldown rows, safe local JSON persistence, one-click
+**Taken**, multiple medications, add/edit with start date/time and interval units, pause/resume, removal, and current-user
+Windows sign-in startup. Still pending: tray show/hide, widget position restoration, drag/lock/always-on-top behavior,
+icon selection/rendering, and final visual/resource polish.
 
 ## Definition of Done for MVP
 
