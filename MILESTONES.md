@@ -126,7 +126,7 @@ added.
 
 ## Milestone 4 — Glanceability, DPI, and interaction polish
 
-**Status: Implementation and automated verification complete; manual interaction acceptance pending.**
+**Status: Complete — automated builds/tests and manual interaction acceptance passed on 2026-08-13.**
 
 ### Outcome
 
@@ -163,6 +163,8 @@ No theming engine, custom skins, sound, toast reminders, dose history, scheduled
 logic is added.
 
 ## Milestone 5 — Completion and release gate
+
+**Status: Implementation, Release builds/tests, and visible-idle resource verification complete; final manual matrix pending.**
 
 ### Outcome
 

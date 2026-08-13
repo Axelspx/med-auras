@@ -223,7 +223,7 @@ The current build includes:
 - optional local medication icons with native image selection and placeholder fallback
 - per-monitor DPI-aware layout, explicit cooldown state labels, local timestamps, and keyboard navigation
 
-Not yet complete: final release/resource verification and the full manual acceptance matrix.
+All planned MVP behavior is implemented. Final acceptance is tracked in `MILESTONES.md`.
 
 ### Build and run in CLion
 
@@ -235,6 +235,31 @@ Medication data is stored at:
 ```text
 %LOCALAPPDATA%\MedAuras\medications.json
 ```
+
+### Release verification
+
+Run the automated model, persistence, legacy-file, malformed-file, and failed-write checks in each configured build:
+
+```text
+cmake --build <build-directory> --config Release
+ctest --test-dir <build-directory> -C Release --output-on-failure
+```
+
+Before release, manually verify this daily-use path on Windows 11:
+
+1. Configure medications, click **Taken**, terminate/relaunch, and confirm the saved anchor and derived timer remain
+   correct.
+2. Exercise edit, pause/resume, removal, icon fallback, tray hide/show, startup enable/disable, position restoration,
+   monitor removal, always-on-top, and keyboard operation.
+3. Confirm active timers remain correct across sleep, hibernation, Windows restart, and wall-clock advancement.
+4. Observe ready/paused and hidden states at idle: CPU should remain effectively 0%, hidden state should have no refresh
+   timer, and a visible active countdown should update no more than once per minute.
+5. Confirm memory, handle, USER, and GDI counts remain stable through repeated use and that the process owns no network
+   endpoints.
+
+The 2026-08-13 development verification produced passing MSVC and CLion-MinGW Release builds/CTest runs. A 20-second
+visible-idle sample used 0 CPU seconds, one thread, approximately 2.8 MB private memory, stable GDI/USER counts, and no
+TCP or UDP endpoints.
 
 ## Status Styling
 

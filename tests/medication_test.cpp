@@ -96,6 +96,32 @@ int main() {
     CHECK(load_medications(json_path)[0].dose == L"50 mg");
     CHECK(!std::filesystem::exists(json_path.wstring() + L".tmp"));
 
+    const std::filesystem::path temporary_path = json_path.wstring() + L".tmp";
+    std::filesystem::create_directory(temporary_path);
+    medication.dose = L"60 mg";
+    bool save_failed{};
+    try {
+        save_medications(json_path, std::vector{medication, second}, settings);
+    } catch (const std::exception&) {
+        save_failed = true;
+    }
+    CHECK(save_failed);
+    CHECK(load_medications(json_path)[0].dose == L"50 mg");
+    std::filesystem::remove(temporary_path);
+
+    const std::filesystem::path corrupt_path = json_path.wstring() + L".corrupt";
+    std::ofstream corrupt(corrupt_path, std::ios::trunc);
+    corrupt << "{\"medications\": [";
+    corrupt.close();
+    bool corrupt_rejected{};
+    try {
+        static_cast<void>(load_medications(corrupt_path));
+    } catch (const std::exception&) {
+        corrupt_rejected = true;
+    }
+    CHECK(corrupt_rejected);
+    std::filesystem::remove(corrupt_path);
+
     std::ofstream legacy(json_path, std::ios::trunc);
     legacy << "{\"medications\": []}\n";
     legacy.close();
