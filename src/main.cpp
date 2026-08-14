@@ -56,6 +56,30 @@ struct DesignTokens {
     float focus_inset{4.0F};
 };
 constexpr DesignTokens design;
+
+// Minimal neutral grey ramp. Surfaces step base -> raised -> elevated, borders are a hairline at
+// roughly 12% white over the base, and text steps primary -> secondary -> muted. Status accents stay
+// chromatic so state is never signalled by grey alone, and the progress bar keeps its own colours.
+constexpr COLORREF surface_base = RGB(24, 24, 27);
+constexpr COLORREF surface_base_paused = RGB(24, 24, 26);
+constexpr COLORREF surface_raised = RGB(39, 39, 42);
+constexpr COLORREF surface_raised_paused = RGB(36, 36, 39);
+constexpr COLORREF surface_elevated = RGB(63, 63, 70);
+constexpr COLORREF surface_elevated_low = RGB(44, 44, 48);
+constexpr COLORREF surface_elevated_paused = RGB(56, 56, 60);
+constexpr COLORREF surface_elevated_low_paused = RGB(44, 44, 47);
+constexpr COLORREF surface_sunken = RGB(31, 31, 34);
+constexpr COLORREF border_hairline = RGB(52, 52, 56);
+constexpr COLORREF border_strong = RGB(82, 82, 91);
+constexpr COLORREF text_primary = RGB(244, 244, 245);
+constexpr COLORREF text_secondary = RGB(161, 161, 170);
+constexpr COLORREF text_muted = RGB(113, 113, 122);
+constexpr COLORREF accent_paused = RGB(138, 138, 147);
+constexpr COLORREF accent_due = RGB(229, 77, 83);
+constexpr COLORREF accent_soon = RGB(232, 169, 66);
+constexpr COLORREF accent_due_text = RGB(244, 104, 110);
+constexpr COLORREF focus_ring = RGB(212, 212, 216);
+
 constexpr UINT toggle_paused_command = 1;
 constexpr UINT remove_medication_command = 2;
 constexpr UINT edit_medication_command = 3;
@@ -997,18 +1021,18 @@ void draw_action_button_geometry(
     const bool disabled = state.disabled;
     const bool pressed = state.pressed;
     const bool hot = state.hot;
-    const COLORREF fill = disabled ? RGB(45, 49, 56)
-                          : pressed ? RGB(53, 59, 70)
-                          : hot     ? RGB(69, 76, 89)
-                                    : RGB(57, 63, 74);
+    const COLORREF fill = disabled ? surface_sunken
+                          : pressed ? surface_raised
+                          : hot     ? surface_elevated
+                                    : surface_elevated_low;
     fill_shape(target, brush, circle, fill);
     stroke_shape(
         target, brush, circle,
-        disabled ? RGB(72, 77, 86) : hot ? RGB(119, 128, 143) : RGB(86, 94, 107));
+        disabled ? border_hairline : hot ? border_strong : surface_elevated);
     if (state.focused) {
         stroke_shape(
             target, brush, inset_shape(circle, design.focus_inset - design.button_inset),
-            RGB(218, 224, 235));
+            focus_ring);
     }
 }
 
@@ -1022,7 +1046,7 @@ void draw_action_button(const DRAWITEMSTRUCT& item) {
     };
     ID2D1SolidColorBrush* brush{};
     if (begin_d2d(item.hDC, item.rcItem, &brush)) {
-        brush->SetColor(d2d_color(RGB(34, 39, 48)));
+        brush->SetColor(d2d_color(surface_raised));
         d2d_render_target->FillRectangle(
             rect(0.0F, 0.0F, dips(item.rcItem.right - item.rcItem.left), dips(item.rcItem.bottom - item.rcItem.top)),
             brush);
@@ -1032,7 +1056,7 @@ void draw_action_button(const DRAWITEMSTRUCT& item) {
     }
 
     SetBkMode(item.hDC, TRANSPARENT);
-    SetTextColor(item.hDC, state.disabled ? RGB(115, 120, 130) : RGB(239, 242, 247));
+    SetTextColor(item.hDC, state.disabled ? text_muted : text_primary);
     SelectObject(item.hDC, glyph_font);
     RECT glyph_bounds = item.rcItem;
     const wchar_t* glyph = taken ? L"\xE73E" : L"\xE70F";
@@ -1058,8 +1082,8 @@ void render_redesigned_widget(
         d2d_render_target->Clear(D2D1::ColorF(0.0F, 0.0F, 0.0F, 0.0F));
         if (medications.empty()) {
             const RoundedShape card = empty_card_layout();
-            fill_gradient(d2d_render_target, card, RGB(40, 46, 56), RGB(24, 29, 37));
-            stroke_shape(d2d_render_target, brush, card, RGB(72, 80, 92));
+            fill_gradient(d2d_render_target, card, surface_raised, surface_base);
+            stroke_shape(d2d_render_target, brush, card, border_hairline);
         } else {
             for (std::size_t index = 0; index < medications.size(); ++index) {
                 const Medication& medication = medications[index];
@@ -1071,21 +1095,19 @@ void render_redesigned_widget(
 
                 fill_gradient(
                     d2d_render_target, layout.card,
-                    paused ? RGB(47, 49, 54) : RGB(43, 49, 59),
-                    paused ? RGB(31, 33, 37) : RGB(24, 29, 37));
-                stroke_shape(d2d_render_target, brush, layout.card, RGB(73, 81, 94));
+                    paused ? surface_raised_paused : surface_raised,
+                    paused ? surface_base_paused : surface_base);
+                stroke_shape(d2d_render_target, brush, layout.card, border_hairline);
                 fill_gradient(
                     d2d_render_target, layout.icon_tile,
-                    paused ? RGB(72, 74, 79) : RGB(68, 75, 87),
-                    paused ? RGB(51, 53, 57) : RGB(45, 51, 61));
-                stroke_shape(d2d_render_target, brush, layout.icon_tile, RGB(91, 99, 112));
+                    paused ? surface_elevated_paused : surface_elevated,
+                    paused ? surface_elevated_low_paused : surface_elevated_low);
+                stroke_shape(d2d_render_target, brush, layout.icon_tile, border_strong);
 
                 const std::wstring state = status_text(medication, now);
                 if (!state.empty()) {
-                    const COLORREF state_accent = paused ? RGB(143, 148, 158)
-                                                  : due   ? RGB(229, 77, 83)
-                                                          : RGB(232, 169, 66);
-                    fill_shape(d2d_render_target, brush, layout.badge, RGB(35, 40, 48));
+                    const COLORREF state_accent = paused ? accent_paused : due ? accent_due : accent_soon;
+                    fill_shape(d2d_render_target, brush, layout.badge, surface_raised);
                     stroke_shape(d2d_render_target, brush, layout.badge, state_accent);
                 }
 
@@ -1112,8 +1134,8 @@ void render_redesigned_widget(
                 stroke_shape(
                     d2d_render_target, brush, layout.progress_bar,
                     due ? accent : RGB(81, 89, 102));
-                fill_shape(d2d_render_target, brush, layout.action_panel, RGB(34, 39, 48));
-                stroke_shape(d2d_render_target, brush, layout.action_panel, RGB(79, 87, 100));
+                fill_shape(d2d_render_target, brush, layout.action_panel, surface_raised);
+                stroke_shape(d2d_render_target, brush, layout.action_panel, border_hairline);
                 draw_action_button_geometry(
                     d2d_render_target, brush, layout.taken_button,
                     button_visual_state(GetDlgItem(
@@ -1136,7 +1158,7 @@ void render_redesigned_widget(
     SetBkMode(device, TRANSPARENT);
 
     if (medications.empty()) {
-        SetTextColor(device, RGB(174, 180, 190));
+        SetTextColor(device, text_secondary);
         SelectObject(device, dose_font);
         DrawText(device, L"Right-click to add medication", -1, &client, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         if (layered_bits) {
@@ -1165,7 +1187,7 @@ void render_redesigned_widget(
             SelectObject(memory, previous);
             DeleteDC(memory);
         } else if (!medication.name.empty()) {
-            SetTextColor(device, paused ? RGB(173, 176, 182) : RGB(239, 242, 247));
+            SetTextColor(device, paused ? text_secondary : text_primary);
             SelectObject(device, initial_font);
             const wchar_t initial[]{medication.name.front(), L'\0'};
             RECT initial_bounds = pixel_rect(layout.icon_tile.bounds);
@@ -1174,20 +1196,18 @@ void render_redesigned_widget(
 
         const std::wstring state = status_text(medication, now);
         RECT name_bounds = pixel_rect(state.empty() ? layout.name_without_state : layout.name_with_state);
-        SetTextColor(device, paused ? RGB(191, 195, 202) : RGB(242, 244, 248));
+        SetTextColor(device, paused ? text_secondary : text_primary);
         SelectObject(device, name_font);
         DrawText(device, medication.name.c_str(), -1, &name_bounds, DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS);
 
         RECT dose_bounds = pixel_rect(layout.dose);
-        SetTextColor(device, RGB(169, 176, 188));
+        SetTextColor(device, text_secondary);
         SelectObject(device, dose_font);
         DrawText(device, medication.dose.c_str(), -1, &dose_bounds, DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS);
 
         if (!state.empty()) {
             RECT badge = pixel_rect(layout.badge.bounds);
-            const COLORREF state_accent = paused ? RGB(143, 148, 158)
-                                          : due   ? RGB(229, 77, 83)
-                                                  : RGB(232, 169, 66);
+            const COLORREF state_accent = paused ? accent_paused : due ? accent_due : accent_soon;
             SetTextColor(device, state_accent);
             SelectObject(device, status_font);
             DrawText(device, state.c_str(), -1, &badge, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
@@ -1196,18 +1216,18 @@ void render_redesigned_widget(
         RECT bar_text = pixel_rect(layout.progress_text);
         const std::wstring text = hovered_bar == index ? local_timestamp_text(medication, now)
                                                        : countdown_text(medication, now);
-        SetTextColor(device, due ? RGB(244, 104, 110) : RGB(240, 243, 248));
+        SetTextColor(device, due ? accent_due_text : text_primary);
         SelectObject(device, countdown_font);
         DrawText(
             device, text.c_str(), -1, &bar_text,
             DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
 
         const HWND taken_button = GetDlgItem(window, first_taken_button_id + static_cast<int>(index));
-        SetTextColor(device, IsWindowEnabled(taken_button) ? RGB(239, 242, 247) : RGB(115, 120, 130));
+        SetTextColor(device, IsWindowEnabled(taken_button) ? text_primary : text_muted);
         SelectObject(device, glyph_font);
         RECT taken_bounds = pixel_rect(layout.taken_button.bounds);
         DrawText(device, L"\xE73E", 1, &taken_bounds, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-        SetTextColor(device, RGB(239, 242, 247));
+        SetTextColor(device, text_primary);
         RECT edit_bounds = pixel_rect(layout.edit_button.bounds);
         DrawText(device, L"\xE70F", 1, &edit_bounds, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
     }
