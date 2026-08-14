@@ -77,6 +77,7 @@ WidgetSettings widget_settings;
 IWICImagingFactory* imaging_factory{};
 ID2D1Factory* d2d_factory{};
 ID2D1DCRenderTarget* d2d_render_target{};
+D2D1_ALPHA_MODE d2d_alpha_mode{D2D1_ALPHA_MODE_UNKNOWN};
 std::vector<HBITMAP> medication_icons;
 HFONT name_font{};
 HFONT dose_font{};
@@ -700,7 +701,18 @@ std::optional<std::size_t> progress_bar_at(const POINT point) {
     return std::nullopt;
 }
 
+void invalidate_progress_bar(const HWND window, const std::optional<std::size_t> index) {
+    if (!index || *index >= medications.size()) return;
+    RECT bounds = pixel_rect(row_layout(*index).progress_bar.bounds);
+    InflateRect(&bounds, 1, 1);
+    InvalidateRect(window, &bounds, FALSE);
+}
+
 void apply_widget_region(const HWND window) {
+    if (widget_settings.background_material == BackgroundMaterial::solid) {
+        SetWindowRgn(window, nullptr, TRUE);
+        return;
+    }
     HRGN combined = CreateRectRgn(0, 0, 0, 0);
     if (!combined) return;
     const int diameter = pixels(design.card_radius * 2.0F);
@@ -730,6 +742,16 @@ void apply_background_material(const HWND window) {
     constexpr int no_backdrop = 1;
     constexpr int main_window_backdrop = 2;
     const BOOL dark = TRUE;
+    LONG_PTR extended_style = GetWindowLongPtr(window, GWL_EXSTYLE);
+    const LONG_PTR desired_style = widget_settings.background_material == BackgroundMaterial::solid
+                                       ? extended_style | WS_EX_LAYERED
+                                       : extended_style & ~static_cast<LONG_PTR>(WS_EX_LAYERED);
+    if (desired_style != extended_style) {
+        SetWindowLongPtr(window, GWL_EXSTYLE, desired_style);
+        SetWindowPos(
+            window, nullptr, 0, 0, 0, 0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+    }
     DwmSetWindowAttribute(window, DWMWA_USE_IMMERSIVE_DARK_MODE, &dark, sizeof(dark));
     const int backdrop = widget_settings.background_material == BackgroundMaterial::mica
                              ? main_window_backdrop
@@ -739,6 +761,7 @@ void apply_background_material(const HWND window) {
     mica_active = widget_settings.background_material == BackgroundMaterial::mica && SUCCEEDED(result);
     const MARGINS margins = mica_active ? MARGINS{-1, -1, -1, -1} : MARGINS{};
     DwmExtendFrameIntoClientArea(window, &margins);
+    apply_widget_region(window);
     InvalidateRect(window, nullptr, TRUE);
 }
 
@@ -935,19 +958,23 @@ D2D1_ROUNDED_RECT native_shape(const RoundedShape& shape) {
     return D2D1::RoundedRect(shape.bounds, shape.radius, shape.radius);
 }
 
-bool begin_d2d(const HDC device, const RECT& bounds, ID2D1SolidColorBrush** brush) {
+bool begin_d2d(
+    const HDC device, const RECT& bounds, ID2D1SolidColorBrush** brush,
+    const D2D1_ALPHA_MODE alpha_mode = D2D1_ALPHA_MODE_IGNORE) {
     if (!d2d_factory && FAILED(D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, &d2d_factory))) {
         return false;
     }
+    if (d2d_render_target && d2d_alpha_mode != alpha_mode) release(d2d_render_target);
     if (!d2d_render_target) {
         const D2D1_RENDER_TARGET_PROPERTIES properties = D2D1::RenderTargetProperties(
             D2D1_RENDER_TARGET_TYPE_SOFTWARE,
-            D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_IGNORE),
+            D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, alpha_mode),
             static_cast<float>(widget_dpi), static_cast<float>(widget_dpi));
         if (FAILED(d2d_factory->CreateDCRenderTarget(&properties, &d2d_render_target))) {
             release(d2d_factory);
             return false;
         }
+        d2d_alpha_mode = alpha_mode;
     }
     d2d_render_target->SetDpi(static_cast<float>(widget_dpi), static_cast<float>(widget_dpi));
     if (FAILED(d2d_render_target->BindDC(device, &bounds))) {
@@ -969,6 +996,7 @@ bool begin_d2d(const HDC device, const RECT& bounds, ID2D1SolidColorBrush** brus
 
 void release_renderer() {
     release(d2d_render_target);
+    d2d_alpha_mode = D2D1_ALPHA_MODE_UNKNOWN;
     release(d2d_factory);
 }
 
@@ -1018,15 +1046,42 @@ void fill_gradient(
     release(collection);
 }
 
-void draw_action_button(const DRAWITEMSTRUCT& item) {
-    const bool taken = item.CtlID >= first_taken_button_id && item.CtlID < first_edit_button_id;
-    const bool disabled = (item.itemState & ODS_DISABLED) != 0;
-    const bool pressed = (item.itemState & ODS_SELECTED) != 0;
-    const bool hot = (item.itemState & ODS_HOTLIGHT) != 0;
+struct ButtonVisualState {
+    bool disabled;
+    bool pressed;
+    bool hot;
+    bool focused;
+};
+
+void draw_action_button_geometry(
+    ID2D1RenderTarget* target, ID2D1SolidColorBrush* brush,
+    const RoundedShape& circle, const ButtonVisualState state) {
+    const bool disabled = state.disabled;
+    const bool pressed = state.pressed;
+    const bool hot = state.hot;
     const COLORREF fill = disabled ? RGB(45, 49, 56)
                           : pressed ? RGB(53, 59, 70)
                           : hot     ? RGB(69, 76, 89)
                                     : RGB(57, 63, 74);
+    fill_shape(target, brush, circle, fill);
+    stroke_shape(
+        target, brush, circle,
+        disabled ? RGB(72, 77, 86) : hot ? RGB(119, 128, 143) : RGB(86, 94, 107));
+    if (state.focused) {
+        stroke_shape(
+            target, brush, inset_shape(circle, design.focus_inset - design.button_inset),
+            RGB(218, 224, 235));
+    }
+}
+
+void draw_action_button(const DRAWITEMSTRUCT& item) {
+    const bool taken = item.CtlID >= first_taken_button_id && item.CtlID < first_edit_button_id;
+    const ButtonVisualState state{
+        .disabled = (item.itemState & ODS_DISABLED) != 0,
+        .pressed = (item.itemState & ODS_SELECTED) != 0,
+        .hot = (item.itemState & ODS_HOTLIGHT) != 0,
+        .focused = (item.itemState & ODS_FOCUS) != 0,
+    };
     ID2D1SolidColorBrush* brush{};
     if (begin_d2d(item.hDC, item.rcItem, &brush)) {
         brush->SetColor(d2d_color(RGB(34, 39, 48)));
@@ -1034,34 +1089,37 @@ void draw_action_button(const DRAWITEMSTRUCT& item) {
             rect(0.0F, 0.0F, dips(item.rcItem.right - item.rcItem.left), dips(item.rcItem.bottom - item.rcItem.top)),
             brush);
         const RoundedShape circle = action_button_shape(item.hwndItem);
-        fill_shape(d2d_render_target, brush, circle, fill);
-        stroke_shape(
-            d2d_render_target, brush, circle,
-            disabled ? RGB(72, 77, 86) : hot ? RGB(119, 128, 143) : RGB(86, 94, 107));
-        if ((item.itemState & ODS_FOCUS) != 0) {
-            stroke_shape(
-                d2d_render_target, brush, inset_shape(circle, design.focus_inset - design.button_inset),
-                RGB(218, 224, 235));
-        }
+        draw_action_button_geometry(d2d_render_target, brush, circle, state);
         end_d2d(GetAncestor(item.hwndItem, GA_ROOT), brush);
     }
 
     SetBkMode(item.hDC, TRANSPARENT);
-    SetTextColor(item.hDC, disabled ? RGB(115, 120, 130) : RGB(239, 242, 247));
+    SetTextColor(item.hDC, state.disabled ? RGB(115, 120, 130) : RGB(239, 242, 247));
     SelectObject(item.hDC, glyph_font);
     RECT glyph_bounds = item.rcItem;
     const wchar_t* glyph = taken ? L"\xE73E" : L"\xE70F";
     DrawText(item.hDC, glyph, 1, &glyph_bounds, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
 }
 
-void paint_redesigned_widget(const HWND window) {
-    PAINTSTRUCT paint{};
-    const HDC device = BeginPaint(window, &paint);
-    RECT client{};
-    GetClientRect(window, &client);
+ButtonVisualState button_visual_state(const HWND button) {
+    const LRESULT state = SendMessage(button, BM_GETSTATE, 0, 0);
+    return ButtonVisualState{
+        .disabled = !IsWindowEnabled(button),
+        .pressed = (state & BST_PUSHED) != 0,
+        .hot = (state & BST_HOT) != 0,
+        .focused = GetFocus() == button,
+    };
+}
+
+void render_redesigned_widget(
+    const HWND window, const HDC device, RECT client,
+    const bool layered, BYTE* const layered_bits, const int surface_width, const int surface_height) {
     const auto now = std::chrono::system_clock::now();
     ID2D1SolidColorBrush* brush{};
-    if (begin_d2d(device, client, &brush)) {
+    if (begin_d2d(
+            device, client, &brush,
+            layered ? D2D1_ALPHA_MODE_PREMULTIPLIED : D2D1_ALPHA_MODE_IGNORE)) {
+        if (layered) d2d_render_target->Clear(D2D1::ColorF(0.0F, 0.0F, 0.0F, 0.0F));
         if (medications.empty()) {
             const RoundedShape card = empty_card_layout();
             if (!mica_active) fill_gradient(d2d_render_target, card, RGB(40, 46, 56), RGB(24, 29, 37));
@@ -1122,9 +1180,25 @@ void paint_redesigned_widget(const HWND window) {
                     due ? accent : RGB(81, 89, 102));
                 fill_shape(d2d_render_target, brush, layout.action_panel, RGB(34, 39, 48));
                 stroke_shape(d2d_render_target, brush, layout.action_panel, RGB(79, 87, 100));
+                if (layered) {
+                    draw_action_button_geometry(
+                        d2d_render_target, brush, layout.taken_button,
+                        button_visual_state(GetDlgItem(
+                            window, first_taken_button_id + static_cast<int>(index))));
+                    draw_action_button_geometry(
+                        d2d_render_target, brush, layout.edit_button,
+                        button_visual_state(GetDlgItem(
+                            window, first_edit_button_id + static_cast<int>(index))));
+                }
             }
         }
         if (!end_d2d(window, brush)) InvalidateRect(window, nullptr, FALSE);
+    }
+
+    std::vector<BYTE> alpha;
+    if (layered_bits) {
+        alpha.resize(static_cast<std::size_t>(surface_width) * static_cast<std::size_t>(surface_height));
+        for (std::size_t index = 0; index < alpha.size(); ++index) alpha[index] = layered_bits[index * 4 + 3];
     }
 
     SetBkMode(device, TRANSPARENT);
@@ -1133,7 +1207,11 @@ void paint_redesigned_widget(const HWND window) {
         SetTextColor(device, RGB(174, 180, 190));
         SelectObject(device, dose_font);
         DrawText(device, L"Right-click to add medication", -1, &client, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-        EndPaint(window, &paint);
+        if (layered_bits) {
+            for (std::size_t index = 0; index < alpha.size(); ++index) {
+                layered_bits[index * 4 + 3] = alpha[index];
+            }
+        }
         return;
     }
 
@@ -1191,9 +1269,76 @@ void paint_redesigned_widget(const HWND window) {
         DrawText(
             device, text.c_str(), -1, &bar_text,
             DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+
+        if (layered) {
+            const HWND taken_button = GetDlgItem(window, first_taken_button_id + static_cast<int>(index));
+            SetTextColor(device, IsWindowEnabled(taken_button) ? RGB(239, 242, 247) : RGB(115, 120, 130));
+            SelectObject(device, glyph_font);
+            RECT taken_bounds = pixel_rect(layout.taken_button.bounds);
+            DrawText(device, L"\xE73E", 1, &taken_bounds, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            SetTextColor(device, RGB(239, 242, 247));
+            RECT edit_bounds = pixel_rect(layout.edit_button.bounds);
+            DrawText(device, L"\xE70F", 1, &edit_bounds, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        }
     }
 
+    if (layered_bits) {
+        for (std::size_t index = 0; index < alpha.size(); ++index) layered_bits[index * 4 + 3] = alpha[index];
+    }
+}
+
+void paint_redesigned_widget(const HWND window) {
+    PAINTSTRUCT paint{};
+    const HDC paint_device = BeginPaint(window, &paint);
+    RECT client{};
+    GetClientRect(window, &client);
+    if (widget_settings.background_material != BackgroundMaterial::solid) {
+        render_redesigned_widget(window, paint_device, client, false, nullptr, 0, 0);
+        EndPaint(window, &paint);
+        return;
+    }
     EndPaint(window, &paint);
+
+    const int width = client.right - client.left;
+    const int height = client.bottom - client.top;
+    BITMAPINFO bitmap_info{};
+    bitmap_info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bitmap_info.bmiHeader.biWidth = width;
+    bitmap_info.bmiHeader.biHeight = -height;
+    bitmap_info.bmiHeader.biPlanes = 1;
+    bitmap_info.bmiHeader.biBitCount = 32;
+    bitmap_info.bmiHeader.biCompression = BI_RGB;
+
+    HDC screen = GetDC(nullptr);
+    HDC memory = screen ? CreateCompatibleDC(screen) : nullptr;
+    void* bits{};
+    HBITMAP bitmap = memory
+                         ? CreateDIBSection(memory, &bitmap_info, DIB_RGB_COLORS, &bits, nullptr, 0)
+                         : nullptr;
+    if (!bitmap || !bits) {
+        if (bitmap) DeleteObject(bitmap);
+        if (memory) DeleteDC(memory);
+        if (screen) ReleaseDC(nullptr, screen);
+        return;
+    }
+
+    const HGDIOBJ previous = SelectObject(memory, bitmap);
+    std::memset(bits, 0, static_cast<std::size_t>(width) * static_cast<std::size_t>(height) * 4);
+    render_redesigned_widget(
+        window, memory, client, true, static_cast<BYTE*>(bits), width, height);
+
+    RECT window_bounds{};
+    GetWindowRect(window, &window_bounds);
+    POINT destination{window_bounds.left, window_bounds.top};
+    POINT source{};
+    SIZE size{width, height};
+    BLENDFUNCTION blend{AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
+    UpdateLayeredWindow(window, screen, &destination, &size, memory, &source, 0, &blend, ULW_ALPHA);
+
+    SelectObject(memory, previous);
+    DeleteObject(bitmap);
+    DeleteDC(memory);
+    ReleaseDC(nullptr, screen);
 }
 
 LRESULT CALLBACK window_procedure(const HWND window, const UINT message, const WPARAM w_param, const LPARAM l_param) {
@@ -1418,16 +1563,19 @@ LRESULT CALLBACK window_procedure(const HWND window, const UINT message, const W
         };
         const auto next_hover = progress_bar_at(point);
         if (next_hover != hovered_bar) {
+            const auto previous_hover = hovered_bar;
             hovered_bar = next_hover;
-            InvalidateRect(window, nullptr, FALSE);
+            invalidate_progress_bar(window, previous_hover);
+            invalidate_progress_bar(window, hovered_bar);
         }
         return 0;
     }
     case WM_MOUSELEAVE:
         tracking_mouse_leave = false;
         if (hovered_bar) {
+            const auto previous_hover = hovered_bar;
             hovered_bar.reset();
-            InvalidateRect(window, nullptr, FALSE);
+            invalidate_progress_bar(window, previous_hover);
         }
         return 0;
     case WM_KEYDOWN:
@@ -1576,7 +1724,7 @@ int WINAPI wWinMain(const HINSTANCE instance, HINSTANCE, PWSTR, const int show_c
                                        : POINT{CW_USEDEFAULT, CW_USEDEFAULT};
     const HWND window = CreateWindowEx(
         WS_EX_TOOLWINDOW | WS_EX_CONTROLPARENT | (widget_settings.always_on_top ? WS_EX_TOPMOST : 0), window_class,
-        L"Medication Cooldown Widget", WS_POPUP, initial_position.x, initial_position.y, widget_width(),
+        L"Medication Cooldown Widget", WS_POPUP | WS_CLIPCHILDREN, initial_position.x, initial_position.y, widget_width(),
         widget_height(), nullptr, nullptr, instance, nullptr);
     if (!window) return 1;
 
@@ -1589,6 +1737,7 @@ int WINAPI wWinMain(const HINSTANCE instance, HINSTANCE, PWSTR, const int show_c
     }
 
     ShowWindow(window, show_command);
+    RedrawWindow(window, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW);
     schedule_refresh(window);
 
     MSG message{};

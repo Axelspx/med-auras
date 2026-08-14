@@ -460,3 +460,61 @@ Verification results:
 The known Option A limitation remains: `SetWindowRgn` still applies an integer/binary union region to expose the desktop around cards and between rows. Direct2D now renders the interior borders and curves smoothly, but the final outside silhouette cannot have true per-pixel alpha while that `HRGN` remains. Solid-mode captures show the remaining limitation is confined to that outside boundary. Mica code paths and fallback behavior still compile, but Mica requires a live visual check after this renderer change.
 
 Option B remains deferred pending the user's assessment of the completed Option A result.
+
+### Option B approval and reported follow-up defects
+
+On 2026-08-14, the user assessed Option A as substantially improved but still found the desktop-facing card-corner radii insufficiently smooth. The user approved beginning **Option B — Option A plus a per-pixel-alpha window surface** so the binary `SetWindowRgn` silhouette can be removed and the same anti-aliased card geometry can supply the final window alpha.
+
+A second defect was reported at the same approval gate: hovering a progress bar to reveal its timestamp causes the native owner-drawn action buttons to flash white squares. This is not assumed to be an outer-alpha artifact. The current hover path invalidates the complete parent window while the two controls remain separate child `BUTTON` HWNDs with their own erase/owner-draw lifecycle. Option B must eliminate the flash by ensuring the action controls and their background are composed atomically, or by otherwise proving that retained native child controls cannot expose an intermediate erased surface.
+
+Option B acceptance therefore requires both:
+
+- genuinely anti-aliased per-pixel outer card corners and inter-card gaps with no visible binary region edge; and
+- no white-square or intermediate-background flash when entering, leaving, or moving between progress bars.
+
+Mica, keyboard navigation, accessible control names, one-click Taken behavior, tooltips, DPI handling, and idle-resource behavior remain protected requirements. If the native per-pixel-alpha presentation path cannot coexist with the current Mica system backdrop, implementation must stop at a documented material decision rather than silently removing or degrading Mica.
+
+### Option B feasibility and material decision
+
+Research and code tracing identified a viable native composition design:
+
+- create the top-level popup with `WS_EX_NOREDIRECTIONBITMAP` so its normal opaque redirection surface does not cover transparent pixels;
+- bind a DirectComposition target to the HWND and place one premultiplied-alpha Direct2D surface in a topmost visual;
+- render the complete card stack, including action-button visuals and text, into that one surface before committing it;
+- retain the existing native child `BUTTON` HWNDs beneath the topmost visual for Tab/Enter/Space behavior, tooltips, accessible names, focus, and command routing; and
+- derive the visual surface alpha and transparent-window hit testing from the existing shared card geometry, removing the visible `SetWindowRgn` mask in the Solid path.
+
+Microsoft documents that a DirectComposition target can be placed above an HWND's child windows and that child-window clipping depends on that target layer. This permits native controls to remain the interaction/accessibility layer while one atomic composition visual supplies their appearance. It should remove the white-square flash because a child button's intermediate erase/owner-draw surface is never exposed above the committed visual.
+
+References:
+
+- [DirectComposition target layering relative to child HWNDs](https://learn.microsoft.com/en-us/windows/win32/api/dcomp/nf-dcomp-idcompositiondesktopdevice-createtargetforhwnd)
+- [DirectComposition surfaces and per-pixel alpha](https://learn.microsoft.com/en-us/windows/win32/directcomp/bitmap-surfaces)
+- [`WS_EX_NOREDIRECTIONBITMAP`](https://learn.microsoft.com/en-us/windows/win32/winmsg/extended-window-styles)
+- [`UpdateLayeredWindow` per-pixel alpha alternative](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-updatelayeredwindow)
+- [Mica as an opaque base-layer material](https://learn.microsoft.com/en-us/windows/apps/desktop/modernize/ui/apply-mica-win32)
+
+The remaining decision is material behavior. Mica is an opaque whole-window backdrop; the Option B surface requires zero-alpha pixels around cards and in row gaps so the actual desktop remains visible. In the current one-HWND architecture, enabling the backdrop would fill those transparent pixels with Mica rather than expose the desktop. The viable scopes are:
+
+1. **Solid-only Option B:** use per-pixel composition for every widget and remove/defer Mica. This is the smallest implementation and gives uniform smooth corners.
+2. **Dual presentation:** use Option B for Solid and retain the Option A `HRGN`/backdrop path for Mica. Mica remains available, but its outer corners keep the known binary-region limitation. Shared layout and drawing code should still be reused; only presentation differs.
+3. **Multi-window material composition:** split cards into separately shaped/backdropped HWNDs so Mica and desktop-visible gaps can coexist. This materially expands window lifecycle, positioning, input, tray, and accessibility complexity and is not recommended for this lightweight widget.
+
+The implementation will use **dual presentation**. Solid mode receives a per-pixel-alpha layered-window path, while Mica retains the existing Option A `HRGN`/backdrop path. This preserves the current material option without expanding the widget into multiple coordinated top-level windows. The known binary outer-edge limitation therefore remains confined to Mica mode; solving that combination would require the separately scoped multi-window material design.
+
+### Option B implementation assessment
+
+The bounded Solid-mode implementation uses the smaller documented `UpdateLayeredWindow` alternative instead of retaining a Direct3D/DirectComposition device graph. The top-level popup becomes `WS_EX_LAYERED` only in Solid mode. Each requested frame is rendered into a top-down 32-bit DIB: Direct2D clears it to transparent, draws the shared rounded geometry with premultiplied alpha, and the existing GDI text/icon pass is then applied while preserving the authoritative Direct2D alpha channel. `UpdateLayeredWindow` publishes the complete bitmap in one operation. Solid mode no longer owns an `HRGN`; Mica removes `WS_EX_LAYERED` and keeps the existing backdrop/region path.
+
+The hover flash was removed at its repaint source. Entering or leaving a progress bar now invalidates only the old and new progress-bar bounds derived from `RowLayout`, rather than invalidating the complete parent and causing unrelated child `BUTTON` windows to repaint. The parent also uses `WS_CLIPCHILDREN`. The layered frame contains the same shared action-button geometry, while the native buttons remain present for hit testing, keyboard input, command routing, tooltips, and accessibility.
+
+Verification results:
+
+- MSVC Release and CLion MinGW Debug builds passed; CTest passed 1/1 in both build trees.
+- A live 100% Solid-mode capture showed smooth desktop-facing card corners and transparent inter-card gaps.
+- Live hit testing passed through the zero-alpha outer corner and row gap to the desktop, retained the widget on the card body, and retained native button ID 100 at the Taken circle center.
+- Progress hover displayed the timestamp correctly. Thirty action-panel samples taken across a live hover transition contained no transient near-white frame or square.
+- Simulated `WM_DPICHANGED` captures at 125%, 150%, and 200% retained smooth, symmetrical card, capsule, and circular-control geometry. Real-monitor checks at those scales remain a release check.
+- A settled 30-second visible-idle sample recorded 0 CPU seconds, approximately 8.34 MB private memory after the multi-DPI QA sequence, 16 threads, and stable handles (219 to 219).
+
+Mica remains intentionally on the Option A region/backdrop presentation path and still needs a live material check. Perfect per-pixel desktop-facing Mica corners remain outside this bounded implementation for the architectural reason documented above.
