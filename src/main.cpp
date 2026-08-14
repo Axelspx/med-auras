@@ -43,11 +43,7 @@ struct DesignTokens {
     float icon_radius{9.0F};
     float content_left{72.0F};
     float content_right{310.0F};
-    float action_panel_left{312.0F};
-    float action_panel_right{394.0F};
-    float action_panel_top{12.0F};
-    float action_panel_bottom{68.0F};
-    float action_panel_radius{9.0F};
+    float action_area_left{312.0F};
     float action_button_padding{5.0F};
     float action_button_gap{8.0F};
     float taken_button_size{36.0F};
@@ -641,7 +637,6 @@ struct RowLayout {
     RoundedShape badge;
     RoundedShape progress_bar;
     D2D1_RECT_F progress_text;
-    RoundedShape action_panel;
     RoundedShape taken_button;
     RoundedShape edit_button;
 };
@@ -661,7 +656,7 @@ RoundedShape capsule(const float left, const float top, const float right, const
 
 RowLayout row_layout(const std::size_t index) {
     const float top = static_cast<float>(index) * (design.row_height + design.row_gap);
-    const float taken_left = design.action_panel_left + design.action_button_padding;
+    const float taken_left = design.action_area_left + design.action_button_padding;
     const float taken_top = top + (design.row_height - design.taken_button_size) * 0.5F;
     const float edit_left = taken_left + design.taken_button_size + design.action_button_gap;
     const float edit_top = top + (design.row_height - design.edit_button_size) * 0.5F;
@@ -675,10 +670,6 @@ RowLayout row_layout(const std::size_t index) {
         .badge = capsule(252.0F, top + 8.0F, design.content_right, top + 28.0F),
         .progress_bar = capsule(design.content_left, top + 45.0F, design.content_right, top + 67.0F),
         .progress_text = rect(80.0F, top + 45.0F, 302.0F, top + 67.0F),
-        .action_panel = rounded_shape(
-            design.action_panel_left, top + design.action_panel_top,
-            design.action_panel_right, top + design.action_panel_bottom,
-            design.action_panel_radius),
         .taken_button = capsule(
             taken_left, taken_top, taken_left + design.taken_button_size,
             taken_top + design.taken_button_size),
@@ -1131,8 +1122,6 @@ void render_redesigned_widget(
                 stroke_shape(
                     d2d_render_target, brush, layout.progress_bar,
                     due ? accent : RGB(81, 89, 102));
-                fill_shape(d2d_render_target, brush, layout.action_panel, surface_raised);
-                stroke_shape(d2d_render_target, brush, layout.action_panel, border_hairline);
                 draw_action_button_geometry(
                     d2d_render_target, brush, layout.taken_button,
                     button_visual_state(GetDlgItem(
