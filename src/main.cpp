@@ -97,6 +97,15 @@ constexpr COLORREF accent_soon = RGB(232, 169, 66);
 constexpr COLORREF accent_due_text = RGB(244, 104, 110);
 constexpr COLORREF focus_ring = RGB(212, 212, 216);
 
+// Progress bar colours are kept separate from the neutral surface ramp: the bar carries state, so
+// it is intentionally the one chromatic element on an otherwise grey card.
+constexpr COLORREF progress_track = RGB(20, 24, 30);
+constexpr COLORREF progress_border = RGB(81, 89, 102);
+constexpr COLORREF progress_normal = RGB(207, 214, 224);
+constexpr COLORREF progress_soon = RGB(221, 158, 54);
+constexpr COLORREF progress_due = RGB(218, 64, 71);
+constexpr COLORREF progress_paused = RGB(111, 116, 126);
+
 constexpr UINT toggle_paused_command = 1;
 constexpr UINT remove_medication_command = 2;
 constexpr UINT edit_medication_command = 3;
@@ -1281,11 +1290,11 @@ void render_redesigned_widget(
                     stroke_shape(d2d_render_target, brush, layout.badge, state_accent);
                 }
 
-                const COLORREF accent = paused ? RGB(111, 116, 126)
-                                        : due   ? RGB(218, 64, 71)
-                                        : soon  ? RGB(221, 158, 54)
-                                                : RGB(207, 214, 224);
-                fill_shape(d2d_render_target, brush, layout.progress_bar, RGB(20, 24, 30));
+                const COLORREF accent = paused ? progress_paused
+                                        : due   ? progress_due
+                                        : soon  ? progress_soon
+                                                : progress_normal;
+                fill_shape(d2d_render_target, brush, layout.progress_bar, progress_track);
                 double progress = paused ? 1.0 : 0.0;
                 if (medication.enabled && remaining > std::chrono::minutes::zero() && medication.interval.count() > 0) {
                     progress = static_cast<double>(remaining.count()) /
@@ -1303,7 +1312,7 @@ void render_redesigned_widget(
                 }
                 stroke_shape(
                     d2d_render_target, brush, layout.progress_bar,
-                    due ? accent : RGB(81, 89, 102));
+                    due ? accent : progress_border);
                 draw_action_button_geometry(
                     d2d_render_target, brush, layout.taken_button,
                     button_visual_state(GetDlgItem(
