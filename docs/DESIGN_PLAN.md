@@ -2,6 +2,8 @@
 
 Status: **approved for implementation on 2026-08-14**
 
+Implementation status: **initial redesign implemented and verified on 2026-08-14**
+
 Reference: `C:\Users\axels\Desktop\MedAurasDesign.png`
 
 ## Goal
@@ -352,3 +354,109 @@ None. Exact color values, corner radii, internal padding, 3-versus-4-DIP gap, an
 ## Approval Gate
 
 The user explicitly confirmed shared understanding and approved this plan on 2026-08-14. Implementation may proceed in a subsequent code-change task, following the implementation outline and acceptance criteria above.
+
+## Implementation Verification
+
+The initial implementation was completed on 2026-08-14 using the existing Win32/GDI renderer plus native DWM Mica support. Solid remains the persisted default/fallback. The fixed 400 × 80 DIP cards, 4 DIP shaped transparent gaps, redesigned state/progress styling, larger Taken check, direct-edit pencil, tooltips/accessibility names, keyboard controls, and progress-bar hover timestamp behavior are present.
+
+Both configured toolchains built successfully and passed the automated medication/storage test:
+
+- MSVC Release: build passed; CTest 1/1 passed.
+- CLion MinGW Debug: build passed; CTest 1/1 passed.
+
+Runtime visual QA used a two-medication stack at 400 × 164 pixels at 100% scale and confirmed the non-rectangular combined window region and four action controls. A 20-second visible-idle sample recorded 0 CPU seconds, approximately 2.22 MB private memory, three threads, stable handle/GDI/USER counts, and no TCP or UDP endpoints.
+
+## Geometry-quality follow-up
+
+Status: **requirements recorded and implementation options researched on 2026-08-14; awaiting user approval before code changes**
+
+### Reported issue and required outcome
+
+The redesigned layout and behavior are accepted, but close inspection shows visible irregularities in thin borders, rounded corners, capsules, circular controls, and nested containers, especially where DPI scaling produces fractional physical-pixel coordinates. The corrective work must address the shared rendering and geometry model rather than patching individual coordinates.
+
+The approved visual design and functionality remain unchanged. The follow-up must:
+
+- render borders, corners, capsules, buttons, progress tracks/fills, icon tiles, badges, action panels, and card containers with smooth, straight, symmetrical, reusable native primitives;
+- derive fill, stroke, clipping, interaction state, and hit testing from one authoritative geometry for each component;
+- centralize design tokens for radii, stroke widths, padding, gaps, and control sizes;
+- calculate layout in floating-point DIPs and convert to physical pixels only at the rendering or HWND boundary;
+- align thin strokes using the active DPI and the stroke centerline rather than unrelated integer offsets;
+- make identical components use the same layout and drawing path;
+- remove duplicated/overlapping strokes, separately calculated visual bounds, inconsistent radius semantics, and hard-coded optical corrections;
+- preserve native C++20/Win32, one-click Taken persistence, keyboard/accessibility behavior, Mica/Solid selection, event-driven redraw, and the effectively-zero-idle-CPU target; and
+- pass visual QA at 100%, 125%, 150%, and 200% Windows scaling.
+
+### Current implementation findings
+
+The artifacts are plausibly produced by several interacting causes in the current GDI path:
+
+1. `scaled(int)` rounds every coordinate independently through `MulDiv`, so related edges, centers, diameters, and insets can round in different directions before drawing.
+2. Layout is stored as integer `RECT` values. At 125% and 150% scale, valid DIP edges often fall between physical pixels, but that fractional information has already been discarded.
+3. GDI `RoundRect`, `CreateRoundRectRgn`, pens, and region clipping are pixel/region based and do not provide Direct2D per-primitive anti-aliasing. The binary union `HRGN` is also the final outer-window silhouette, so its stair-stepped edge cannot be repaired by improving only the interior paint.
+4. A nominal one-DIP border is created as an integer GDI pen after scaling. GDI centers the pen on integer geometry bounds, while the fill, outline, gradient clip, and window region use slightly different inclusive/exclusive edge adjustments (`+1`, inflation, and separate rectangles).
+5. The card top highlight is a separate `MoveToEx`/`LineTo` segment rather than part of the card geometry or a geometry-derived clipped highlight. That can visibly disagree with the rounded card edge.
+6. Buttons, cards, progress bars, badges, and panels reuse drawing helpers, but their layout, radii, fill bounds, outline bounds, child-window bounds, hover bounds, and parent-painted backgrounds are still calculated in separate places. This allows small mismatches and overlapping paint at component boundaries.
+7. Capsules use a radius/diameter convention inconsistently: some calls pass a fixed scaled value while buttons derive the value from their already-rounded integer height. Equal logical shapes can therefore rasterize differently.
+
+Microsoft's guidance supports moving geometry-sensitive drawing to Direct2D: Direct2D uses floating-point DIPs and maps them through the render target DPI, provides per-primitive anti-aliasing, and exposes native rounded-rectangle and ellipse geometries whose fill/stroke containment operations can also drive hit testing. GDI remains supported for interoperability, so the migration does not require replacing the Win32 application model, native child controls, persistence, timers, or tray behavior.
+
+References:
+
+- [DPI and device-independent pixels](https://learn.microsoft.com/en-us/windows/win32/learnwin32/dpi-and-device-independent-pixels)
+- [Direct2D geometries overview](https://learn.microsoft.com/en-us/windows/win32/direct2d/direct2d-geometries-overview)
+- [Direct2D anti-alias mode](https://learn.microsoft.com/en-us/windows/win32/api/d2d1/nf-d2d1-id2d1rendertarget-setantialiasmode)
+- [Direct2D/GDI interoperability](https://learn.microsoft.com/en-us/windows/win32/direct2d/interoperability-overview)
+- [SetWindowRgn](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-setwindowrgn)
+- [Direct2D pixel formats and alpha modes](https://learn.microsoft.com/en-us/windows/win32/direct2d/supported-pixel-formats-and-alpha-modes)
+
+### Implementation options
+
+#### Option A — Shared DIP layout plus Direct2D for all custom geometry
+
+Replace the custom GDI shape helpers with Direct2D rounded rectangles, ellipses, gradients, geometry masks/clips, and strokes. Introduce one compact `DesignTokens` value set and one `RowLayout` result containing floating-point DIP geometry for every component. Painting, hover detection, and any custom hit testing consume that same layout. Keep native Win32 child buttons and existing GDI/Win32 text or WIC icon behavior where interoperation is sufficient.
+
+Thin-stroke alignment is handled centrally: the helper transforms a DIP edge to device pixels, aligns the stroke centerline for the actual physical stroke width, and transforms it back before drawing. Fill and border consume the same rounded rectangle, with the stroke centered or explicitly inset by half its width according to one documented convention.
+
+This is the smallest architecture change capable of fixing interior anti-aliasing and consistency. It preserves the current event-driven paint lifecycle and should not add idle work. Its limitation is that `SetWindowRgn` remains a binary outer mask, so the very outside card corners and transparent inter-card gaps may still show region-edge aliasing even when every interior primitive is smooth.
+
+#### Option B — Option A plus a per-pixel-alpha window surface
+
+Render the complete widget with Direct2D to a premultiplied-alpha surface and present it through a layered/composition window. Use the same card geometries both as alpha masks and as painted shapes, eliminating the binary `HRGN` from the visible silhouette and producing anti-aliased outer corners and gaps.
+
+This is the only option that directly addresses both interior geometry and the final transparent window boundary. It is more invasive: transparent-surface text needs deliberate alpha handling, native child HWND composition must be verified or reworked, and the existing DWM Mica backdrop may not compose through the same per-pixel-alpha path. Mica compatibility therefore requires a focused prototype before this option can be approved as a drop-in replacement.
+
+#### Option C — Normalize the existing GDI geometry only
+
+Centralize tokens and layout, compute once, remove the standalone highlight line, standardize radius semantics, and derive all integer rectangles from a single DIP layout at the last possible moment, while retaining GDI `RoundRect` and `HRGN` rendering.
+
+This would remove many asymmetries and duplicated calculations with the least code churn, but it cannot satisfy the requirement for consistently anti-aliased curves and outer edges at fractional scaling. It is useful only as a fallback or diagnostic step, not as the production-quality final fix.
+
+### Proposed direction and approval gate
+
+The recommended sequence is a bounded Option A rendering spike on one complete medication card, including both owner-drawn action controls, at all four target DPI values. The spike should prove the shared floating-point layout, geometry-based paint/hover logic, stroke alignment, device-loss recovery, Mica/Solid behavior, and unchanged idle scheduling. If only the binary outer silhouette remains visibly aliased, evaluate the smallest Option B composition prototype before deciding whether that additional complexity is justified.
+
+No rendering implementation should begin until the user confirms an option. Coordinate-level visual patches and an open-ended rendering-framework rewrite are explicitly rejected.
+
+### Option selection
+
+On 2026-08-14, the user approved **Option A — Shared DIP layout plus Direct2D for all custom geometry** as the first implementation step. The result must be visually assessed before any decision about Option B. Option B remains unapproved and must not be introduced unless the completed Option A assessment shows that the binary outer-window region is still materially visible and the user explicitly accepts the additional composition work.
+
+### Option A implementation assessment
+
+Option A was implemented on 2026-08-14. All custom card, tile, badge, progress, panel, and action-button geometry now uses Direct2D rounded-rectangle/ellipse primitives with per-primitive anti-aliasing. One floating-point DIP `RowLayout` and centralized design-token set supplies drawing, native child placement, progress hover detection, card hit testing, and circular button hit testing. Fill and border geometry use one shared outer shape with a consistent inset-stroke convention. The separately painted card highlight line and the previous GDI `RoundRect`/gradient clip helpers were removed.
+
+The Direct2D DC render target uses software rendering so geometry quality does not retain a hardware graphics-device footprint. A 50 ms one-shot cleanup timer shares Direct2D resources across a repaint burst and then releases the target and factory; this is event-scoped cleanup rather than continuous polling.
+
+Verification results:
+
+- MSVC Release build passed; CTest passed 1/1.
+- CLion MinGW Debug build passed; CTest passed 1/1.
+- Actual 100% visual QA passed for card geometry, capsules, icon tiles, action panel, and centered circular controls.
+- Simulated `WM_DPICHANGED` captures at 125%, 150%, and 200% remained smooth, aligned, and symmetrical; real-monitor verification at those scales remains a release check.
+- Progress hover still swaps to the factual timestamp using the shared rounded progress geometry.
+- Native Taken button hit testing returned `HTCLIENT` at the circle center and `HTTRANSPARENT` at a square corner, without activating the action.
+- A 20-second visible-idle sample recorded 0 CPU seconds, approximately 4.74 MB private memory, 11 threads, stable GDI/USER counts, and no handle growth.
+
+The known Option A limitation remains: `SetWindowRgn` still applies an integer/binary union region to expose the desktop around cards and between rows. Direct2D now renders the interior borders and curves smoothly, but the final outside silhouette cannot have true per-pixel alpha while that `HRGN` remains. Solid-mode captures show the remaining limitation is confined to that outside boundary. Mica code paths and fallback behavior still compile, but Mica requires a live visual check after this renderer change.
+
+Option B remains deferred pending the user's assessment of the completed Option A result.

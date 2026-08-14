@@ -5,6 +5,9 @@
 #include <windows.h>
 #include <commctrl.h>
 #include <commdlg.h>
+#include <d2d1.h>
+#include <d2d1helper.h>
+#include <dwmapi.h>
 #include <shellapi.h>
 #include <shlobj.h>
 #include <wincodec.h>
@@ -27,18 +30,41 @@
 namespace {
 constexpr wchar_t window_class[] = L"MedAurasWindow";
 constexpr UINT_PTR refresh_timer = 1;
+constexpr UINT_PTR renderer_release_timer = 2;
 constexpr int first_taken_button_id = 100;
-constexpr int widget_width_dip = 420;
-constexpr int row_top = 12;
-constexpr int row_step = 80;
-constexpr int row_height = 76;
-constexpr int icon_size_dip = 48;
+constexpr int first_edit_button_id = 200;
+struct DesignTokens {
+    float widget_width{400.0F};
+    float empty_height{60.0F};
+    float row_height{80.0F};
+    float row_gap{4.0F};
+    float card_radius{14.0F};
+    float stroke{1.0F};
+    float icon_size{48.0F};
+    float icon_radius{9.0F};
+    float content_left{72.0F};
+    float content_right{310.0F};
+    float action_panel_left{312.0F};
+    float action_panel_right{394.0F};
+    float action_panel_top{12.0F};
+    float action_panel_bottom{68.0F};
+    float action_panel_radius{9.0F};
+    float action_button_padding{5.0F};
+    float action_button_gap{8.0F};
+    float taken_button_size{36.0F};
+    float edit_button_size{28.0F};
+    float button_inset{1.0F};
+    float focus_inset{4.0F};
+};
+constexpr DesignTokens design;
 constexpr UINT toggle_paused_command = 1;
 constexpr UINT remove_medication_command = 2;
 constexpr UINT edit_medication_command = 3;
 constexpr UINT add_medication_command = 4;
 constexpr UINT lock_position_command = 5;
 constexpr UINT always_on_top_command = 6;
+constexpr UINT solid_material_command = 7;
+constexpr UINT mica_material_command = 8;
 constexpr UINT tray_show_hide_command = 10;
 constexpr UINT tray_startup_command = 11;
 constexpr UINT tray_exit_command = 12;
@@ -49,20 +75,42 @@ std::vector<Medication> medications;
 std::filesystem::path medications_path;
 WidgetSettings widget_settings;
 IWICImagingFactory* imaging_factory{};
+ID2D1Factory* d2d_factory{};
+ID2D1DCRenderTarget* d2d_render_target{};
 std::vector<HBITMAP> medication_icons;
-HFONT widget_font{};
-HFONT widget_font_bold{};
+HFONT name_font{};
+HFONT dose_font{};
+HFONT status_font{};
+HFONT countdown_font{};
+HFONT initial_font{};
+HFONT glyph_font{};
 UINT widget_dpi = 96;
 bool enable_startup_after_save{};
 bool tray_icon_added{};
 UINT taskbar_created_message{};
+HWND tooltip_window{};
+std::optional<std::size_t> hovered_bar;
+bool tracking_mouse_leave{};
+bool mica_active{};
+
+float dpi_scale() {
+    return static_cast<float>(widget_dpi) / 96.0F;
+}
+
+int pixels(const float dips) {
+    return static_cast<int>(std::lround(dips * dpi_scale()));
+}
+
+float dips(const int pixels_value) {
+    return static_cast<float>(pixels_value) / dpi_scale();
+}
 
 int scaled(const int value) {
-    return MulDiv(value, static_cast<int>(widget_dpi), 96);
+    return pixels(static_cast<float>(value));
 }
 
 int widget_width() {
-    return scaled(widget_width_dip);
+    return pixels(design.widget_width);
 }
 
 void enable_per_monitor_dpi() {
@@ -110,8 +158,9 @@ Medication example_medication() {
 }
 
 int widget_height() {
-    if (medications.empty()) return scaled(60);
-    return scaled(row_top * 2 + static_cast<int>(medications.size()) * row_step - (row_step - row_height));
+    if (medications.empty()) return pixels(design.empty_height);
+    const float rows = static_cast<float>(medications.size());
+    return pixels(rows * design.row_height + (rows - 1.0F) * design.row_gap);
 }
 
 void enable_startup_if_needed(const HWND window) {
@@ -293,14 +342,14 @@ std::wstring new_medication_id() {
 std::wstring status_text(const Medication& medication, const std::chrono::system_clock::time_point now) {
     if (!medication.enabled) return L"PAUSED";
     const std::chrono::minutes remaining = medication.remaining_at(now);
-    if (remaining == std::chrono::minutes::zero()) return L"READY";
-    return medication.is_soon_at(now) ? L"SOON" : L"ACTIVE";
+    if (remaining == std::chrono::minutes::zero()) return L"DUE";
+    return medication.is_soon_at(now) ? L"SOON" : L"";
 }
 
 std::wstring countdown_text(const Medication& medication, const std::chrono::system_clock::time_point now) {
-    if (!medication.enabled) return {};
+    if (!medication.enabled) return L"PAUSED";
     const std::chrono::minutes remaining = medication.remaining_at(now);
-    if (remaining == std::chrono::minutes::zero()) return {};
+    if (remaining == std::chrono::minutes::zero()) return L"DUE";
     const auto hours = std::chrono::duration_cast<std::chrono::hours>(remaining);
     const auto minutes = remaining - hours;
     return hours == std::chrono::hours::zero()
@@ -310,10 +359,8 @@ std::wstring countdown_text(const Medication& medication, const std::chrono::sys
 
 std::wstring local_timestamp_text(
     const Medication& medication, const std::chrono::system_clock::time_point now) {
-    const auto timestamp = medication.remaining_at(now) > std::chrono::minutes::zero()
-                               ? medication.next_available_at()
-                               : medication.last_taken_at;
-    if (!timestamp) return {};
+    const auto timestamp = medication.next_available_at();
+    if (!timestamp) return countdown_text(medication, now);
 
     const SYSTEMTIME local = local_time_for(*timestamp);
     std::array<wchar_t, 32> date{};
@@ -325,8 +372,10 @@ std::wstring local_timestamp_text(
             static_cast<int>(time.size()))) {
         return {};
     }
-    return std::wstring{medication.remaining_at(now) > std::chrono::minutes::zero() ? L"Next " : L"Last "} +
-           date.data() + L" " + time.data();
+    const wchar_t* prefix = !medication.enabled                                      ? L"Was due "
+                            : medication.remaining_at(now) == std::chrono::minutes::zero() ? L"Since "
+                                                                                      : L"";
+    return std::wstring{prefix} + date.data() + L" " + time.data();
 }
 
 void schedule_refresh(const HWND window) {
@@ -352,15 +401,23 @@ void clear_medication_icons() {
 }
 
 void rebuild_fonts() {
-    if (widget_font) DeleteObject(widget_font);
-    if (widget_font_bold) DeleteObject(widget_font_bold);
-    const int height = -MulDiv(9, static_cast<int>(widget_dpi), 72);
-    widget_font = CreateFont(
-        height, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
-        CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
-    widget_font_bold = CreateFont(
-        height, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
-        CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
+    if (name_font) DeleteObject(name_font);
+    if (dose_font) DeleteObject(dose_font);
+    if (status_font) DeleteObject(status_font);
+    if (countdown_font) DeleteObject(countdown_font);
+    if (initial_font) DeleteObject(initial_font);
+    if (glyph_font) DeleteObject(glyph_font);
+    const auto make_font = [](const int dip, const int weight, const wchar_t* face) {
+        return CreateFont(
+            -scaled(dip), 0, 0, 0, weight, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
+            CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, face);
+    };
+    name_font = make_font(14, FW_SEMIBOLD, L"Segoe UI");
+    dose_font = make_font(11, FW_NORMAL, L"Segoe UI");
+    status_font = make_font(10, FW_SEMIBOLD, L"Segoe UI");
+    countdown_font = make_font(12, FW_SEMIBOLD, L"Segoe UI");
+    initial_font = make_font(24, FW_SEMIBOLD, L"Segoe UI");
+    glyph_font = make_font(18, FW_NORMAL, L"Segoe Fluent Icons");
 }
 
 HBITMAP load_medication_icon(const std::wstring& path) {
@@ -371,12 +428,12 @@ HBITMAP load_medication_icon(const std::wstring& path) {
     IWICBitmapScaler* scaler{};
     IWICFormatConverter* converter{};
     HBITMAP bitmap{};
-    void* pixels{};
+    void* bitmap_pixels{};
     UINT width{};
     UINT height{};
     UINT scaled_width{};
     UINT scaled_height{};
-    const UINT icon_size = static_cast<UINT>(scaled(icon_size_dip));
+    const UINT icon_size = static_cast<UINT>(pixels(design.icon_size));
 
     HRESULT result = imaging_factory->CreateDecoderFromFilename(
         path.c_str(), nullptr, GENERIC_READ, WICDecodeMetadataCacheOnLoad, &decoder);
@@ -408,15 +465,15 @@ HBITMAP load_medication_icon(const std::wstring& path) {
         info.bmiHeader.biBitCount = 32;
         info.bmiHeader.biCompression = BI_RGB;
         const HDC device = GetDC(nullptr);
-        bitmap = CreateDIBSection(device, &info, DIB_RGB_COLORS, &pixels, nullptr, 0);
+        bitmap = CreateDIBSection(device, &info, DIB_RGB_COLORS, &bitmap_pixels, nullptr, 0);
         ReleaseDC(nullptr, device);
-        if (!bitmap || !pixels) result = E_OUTOFMEMORY;
+        if (!bitmap || !bitmap_pixels) result = E_OUTOFMEMORY;
     }
     if (SUCCEEDED(result)) {
         const UINT stride = icon_size * 4;
-        std::memset(pixels, 0, icon_size * stride);
-        auto* destination = static_cast<BYTE*>(pixels) + ((icon_size - scaled_height) / 2 * icon_size +
-                                                          (icon_size - scaled_width) / 2) * 4;
+        std::memset(bitmap_pixels, 0, icon_size * stride);
+        auto* destination = static_cast<BYTE*>(bitmap_pixels) + ((icon_size - scaled_height) / 2 * icon_size +
+                                                                 (icon_size - scaled_width) / 2) * 4;
         const UINT buffer_size = stride * (scaled_height - 1) + scaled_width * 4;
         result = converter->CopyPixels(nullptr, stride, buffer_size, destination);
     }
@@ -548,42 +605,248 @@ void show_tray_menu(const HWND window, const POINT point) {
     }
 }
 
+struct RoundedShape {
+    D2D1_RECT_F bounds;
+    float radius;
+};
+
+RoundedShape aligned_shape(const RoundedShape& shape);
+
+struct RowLayout {
+    RoundedShape card;
+    RoundedShape icon_tile;
+    D2D1_RECT_F icon;
+    D2D1_RECT_F name_with_state;
+    D2D1_RECT_F name_without_state;
+    D2D1_RECT_F dose;
+    RoundedShape badge;
+    RoundedShape progress_bar;
+    D2D1_RECT_F progress_text;
+    RoundedShape action_panel;
+    RoundedShape taken_button;
+    RoundedShape edit_button;
+};
+
+D2D1_RECT_F rect(const float left, const float top, const float right, const float bottom) {
+    return D2D1::RectF(left, top, right, bottom);
+}
+
+RoundedShape rounded_shape(
+    const float left, const float top, const float right, const float bottom, const float radius) {
+    return RoundedShape{rect(left, top, right, bottom), radius};
+}
+
+RoundedShape capsule(const float left, const float top, const float right, const float bottom) {
+    return rounded_shape(left, top, right, bottom, (bottom - top) * 0.5F);
+}
+
+RowLayout row_layout(const std::size_t index) {
+    const float top = static_cast<float>(index) * (design.row_height + design.row_gap);
+    const float taken_left = design.action_panel_left + design.action_button_padding;
+    const float taken_top = top + (design.row_height - design.taken_button_size) * 0.5F;
+    const float edit_left = taken_left + design.taken_button_size + design.action_button_gap;
+    const float edit_top = top + (design.row_height - design.edit_button_size) * 0.5F;
+    return RowLayout{
+        .card = rounded_shape(0.0F, top, design.widget_width, top + design.row_height, design.card_radius),
+        .icon_tile = rounded_shape(8.0F, top + 8.0F, 64.0F, top + 72.0F, design.icon_radius),
+        .icon = rect(12.0F, top + 16.0F, 60.0F, top + 64.0F),
+        .name_with_state = rect(design.content_left, top + 7.0F, 248.0F, top + 27.0F),
+        .name_without_state = rect(design.content_left, top + 7.0F, 306.0F, top + 27.0F),
+        .dose = rect(design.content_left, top + 27.0F, design.content_right, top + 43.0F),
+        .badge = capsule(252.0F, top + 8.0F, design.content_right, top + 28.0F),
+        .progress_bar = capsule(design.content_left, top + 45.0F, design.content_right, top + 67.0F),
+        .progress_text = rect(80.0F, top + 45.0F, 302.0F, top + 67.0F),
+        .action_panel = rounded_shape(
+            design.action_panel_left, top + design.action_panel_top,
+            design.action_panel_right, top + design.action_panel_bottom,
+            design.action_panel_radius),
+        .taken_button = capsule(
+            taken_left, taken_top, taken_left + design.taken_button_size,
+            taken_top + design.taken_button_size),
+        .edit_button = capsule(
+            edit_left, edit_top, edit_left + design.edit_button_size,
+            edit_top + design.edit_button_size),
+    };
+}
+
+RoundedShape empty_card_layout() {
+    return rounded_shape(0.0F, 0.0F, design.widget_width, design.empty_height, design.card_radius);
+}
+
+RECT pixel_rect(const D2D1_RECT_F bounds) {
+    return RECT{pixels(bounds.left), pixels(bounds.top), pixels(bounds.right), pixels(bounds.bottom)};
+}
+
+bool contains(const RoundedShape& shape, const D2D1_POINT_2F point) {
+    const RoundedShape aligned = aligned_shape(shape);
+    const D2D1_RECT_F bounds = aligned.bounds;
+    if (point.x < bounds.left || point.x >= bounds.right || point.y < bounds.top || point.y >= bounds.bottom) {
+        return false;
+    }
+    const float radius = std::min(
+        aligned.radius, std::min((bounds.right - bounds.left) * 0.5F, (bounds.bottom - bounds.top) * 0.5F));
+    const float center_x = std::clamp(point.x, bounds.left + radius, bounds.right - radius);
+    const float center_y = std::clamp(point.y, bounds.top + radius, bounds.bottom - radius);
+    const float dx = point.x - center_x;
+    const float dy = point.y - center_y;
+    return dx * dx + dy * dy <= radius * radius;
+}
+
+std::optional<std::size_t> progress_bar_at(const POINT point) {
+    const D2D1_POINT_2F dip_point = D2D1::Point2F(dips(point.x), dips(point.y));
+    for (std::size_t index = 0; index < medications.size(); ++index) {
+        if (contains(row_layout(index).progress_bar, dip_point)) return index;
+    }
+    return std::nullopt;
+}
+
+void apply_widget_region(const HWND window) {
+    HRGN combined = CreateRectRgn(0, 0, 0, 0);
+    if (!combined) return;
+    const int diameter = pixels(design.card_radius * 2.0F);
+    if (medications.empty()) {
+        const RECT bounds = pixel_rect(empty_card_layout().bounds);
+        const HRGN card = CreateRoundRectRgn(
+            bounds.left, bounds.top, bounds.right + 1, bounds.bottom + 1, diameter, diameter);
+        if (card) {
+            CombineRgn(combined, card, nullptr, RGN_COPY);
+            DeleteObject(card);
+        }
+    } else {
+        for (std::size_t index = 0; index < medications.size(); ++index) {
+            const RECT bounds = pixel_rect(row_layout(index).card.bounds);
+            const HRGN card = CreateRoundRectRgn(
+                bounds.left, bounds.top, bounds.right + 1, bounds.bottom + 1, diameter, diameter);
+            if (!card) continue;
+            CombineRgn(combined, combined, card, RGN_OR);
+            DeleteObject(card);
+        }
+    }
+    if (!SetWindowRgn(window, combined, TRUE)) DeleteObject(combined);
+}
+
+void apply_background_material(const HWND window) {
+    constexpr DWORD backdrop_attribute = 38;
+    constexpr int no_backdrop = 1;
+    constexpr int main_window_backdrop = 2;
+    const BOOL dark = TRUE;
+    DwmSetWindowAttribute(window, DWMWA_USE_IMMERSIVE_DARK_MODE, &dark, sizeof(dark));
+    const int backdrop = widget_settings.background_material == BackgroundMaterial::mica
+                             ? main_window_backdrop
+                             : no_backdrop;
+    const HRESULT result = DwmSetWindowAttribute(
+        window, static_cast<DWMWINDOWATTRIBUTE>(backdrop_attribute), &backdrop, sizeof(backdrop));
+    mica_active = widget_settings.background_material == BackgroundMaterial::mica && SUCCEEDED(result);
+    const MARGINS margins = mica_active ? MARGINS{-1, -1, -1, -1} : MARGINS{};
+    DwmExtendFrameIntoClientArea(window, &margins);
+    InvalidateRect(window, nullptr, TRUE);
+}
+
 std::optional<std::size_t> medication_at(const HWND window, POINT point) {
     if (point.x == -1 && point.y == -1) {
-        const int focused_index = GetDlgCtrlID(GetFocus()) - first_taken_button_id;
-        if (focused_index >= 0 && static_cast<std::size_t>(focused_index) < medications.size()) {
-            return static_cast<std::size_t>(focused_index);
+        const int focused_id = GetDlgCtrlID(GetFocus());
+        const int taken_index = focused_id - first_taken_button_id;
+        const int edit_index = focused_id - first_edit_button_id;
+        if (taken_index >= 0 && static_cast<std::size_t>(taken_index) < medications.size()) {
+            return static_cast<std::size_t>(taken_index);
+        }
+        if (edit_index >= 0 && static_cast<std::size_t>(edit_index) < medications.size()) {
+            return static_cast<std::size_t>(edit_index);
         }
         return medications.empty() ? std::nullopt : std::optional<std::size_t>{0};
     }
     ScreenToClient(window, &point);
-    if (point.x < scaled(12) || point.x >= scaled(408) || point.y < scaled(row_top)) return std::nullopt;
-    const int offset = point.y - scaled(row_top);
-    const std::size_t index = static_cast<std::size_t>(offset / scaled(row_step));
-    if (offset % scaled(row_step) >= scaled(row_height) || index >= medications.size()) return std::nullopt;
-    return index;
+    const D2D1_POINT_2F dip_point = D2D1::Point2F(dips(point.x), dips(point.y));
+    for (std::size_t index = 0; index < medications.size(); ++index) {
+        if (contains(row_layout(index).card, dip_point)) return index;
+    }
+    return std::nullopt;
 }
 
-bool create_taken_buttons(const HWND window) {
+bool add_button_tooltip(const HWND button, const wchar_t* text) {
+    if (!tooltip_window) return false;
+    TOOLINFO info{sizeof(TOOLINFO)};
+    info.uFlags = TTF_IDISHWND | TTF_SUBCLASS;
+    info.hwnd = GetParent(button);
+    info.uId = reinterpret_cast<UINT_PTR>(button);
+    info.lpszText = const_cast<wchar_t*>(text);
+    return SendMessage(tooltip_window, TTM_ADDTOOL, 0, reinterpret_cast<LPARAM>(&info)) != FALSE;
+}
+
+RoundedShape action_button_shape(const HWND button) {
+    RECT client{};
+    GetClientRect(button, &client);
+    const float width = dips(client.right - client.left);
+    const float height = dips(client.bottom - client.top);
+    const float inset = design.button_inset;
+    return rounded_shape(
+        inset, inset, width - inset, height - inset,
+        std::max(0.0F, std::min(width, height) * 0.5F - inset));
+}
+
+LRESULT CALLBACK action_button_procedure(
+    const HWND button, const UINT message, const WPARAM w_param, const LPARAM l_param,
+    UINT_PTR, DWORD_PTR) {
+    if (message == WM_NCHITTEST) {
+        POINT point{
+            static_cast<LONG>(static_cast<short>(LOWORD(l_param))),
+            static_cast<LONG>(static_cast<short>(HIWORD(l_param))),
+        };
+        ScreenToClient(button, &point);
+        if (!contains(action_button_shape(button), D2D1::Point2F(dips(point.x), dips(point.y)))) {
+            return HTTRANSPARENT;
+        }
+    } else if (message == WM_NCDESTROY) {
+        RemoveWindowSubclass(button, action_button_procedure, 1);
+    }
+    return DefSubclassProc(button, message, w_param, l_param);
+}
+
+bool create_action_buttons(const HWND window) {
+    tooltip_window = CreateWindowEx(
+        WS_EX_TOPMOST, TOOLTIPS_CLASS, nullptr, WS_POPUP | TTS_ALWAYSTIP | TTS_NOPREFIX,
+        CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, window, nullptr,
+        GetModuleHandle(nullptr), nullptr);
     for (std::size_t index = 0; index < medications.size(); ++index) {
-        const int button_id = first_taken_button_id + static_cast<int>(index);
-        const HWND button = CreateWindow(
-            L"BUTTON", L"Taken", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON, scaled(322),
-            scaled(row_top + static_cast<int>(index * row_step) + 20), scaled(76), scaled(36), window,
-            reinterpret_cast<HMENU>(static_cast<INT_PTR>(button_id)), GetModuleHandle(nullptr), nullptr);
-        if (!button) return false;
-        SendMessage(button, WM_SETFONT, reinterpret_cast<WPARAM>(widget_font), TRUE);
-        EnableWindow(button, medications[index].enabled);
+        const RowLayout layout = row_layout(index);
+        const RECT taken = pixel_rect(layout.taken_button.bounds);
+        const HWND taken_button = CreateWindow(
+            L"BUTTON", L"Taken", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+            taken.left, taken.top, taken.right - taken.left, taken.bottom - taken.top, window,
+            reinterpret_cast<HMENU>(static_cast<INT_PTR>(first_taken_button_id + static_cast<int>(index))),
+            GetModuleHandle(nullptr), nullptr);
+        const RECT edit = pixel_rect(layout.edit_button.bounds);
+        const HWND edit_button = CreateWindow(
+            L"BUTTON", L"Edit medication", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+            edit.left, edit.top, edit.right - edit.left, edit.bottom - edit.top, window,
+            reinterpret_cast<HMENU>(static_cast<INT_PTR>(first_edit_button_id + static_cast<int>(index))),
+            GetModuleHandle(nullptr), nullptr);
+        if (!taken_button || !edit_button) return false;
+        if (!SetWindowSubclass(taken_button, action_button_procedure, 1, 0) ||
+            !SetWindowSubclass(edit_button, action_button_procedure, 1, 0)) {
+            return false;
+        }
+        EnableWindow(taken_button, medications[index].enabled);
+        if (tooltip_window) {
+            static_cast<void>(add_button_tooltip(taken_button, L"Taken"));
+            static_cast<void>(add_button_tooltip(edit_button, L"Edit medication"));
+        }
     }
     return true;
 }
 
 bool rebuild_widget(const HWND window) {
     while (const HWND child = GetWindow(window, GW_CHILD)) DestroyWindow(child);
+    if (tooltip_window) DestroyWindow(tooltip_window);
+    tooltip_window = nullptr;
+    hovered_bar.reset();
+    tracking_mouse_leave = false;
     rebuild_medication_icons();
-    if (!create_taken_buttons(window)) return false;
+    if (!create_action_buttons(window)) return false;
     SetWindowPos(
         window, nullptr, 0, 0, widget_width(), widget_height(), SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+    apply_widget_region(window);
+    apply_background_material(window);
     RECT bounds{};
     if (GetWindowRect(window, &bounds)) {
         const POINT clamped = clamped_widget_position({bounds.left, bounds.top});
@@ -599,110 +862,335 @@ bool rebuild_widget(const HWND window) {
     return true;
 }
 
-void paint_widget(const HWND window) {
+void mark_medication_taken(const HWND window, const std::size_t index) {
+    Medication& medication = medications[index];
+    const auto previous = medication.last_taken_at;
+    medication.mark_taken(std::chrono::system_clock::now());
+    try {
+        save_state();
+        enable_startup_if_needed(window);
+    } catch (const std::exception&) {
+        medication.last_taken_at = previous;
+        MessageBox(
+            window, L"The medication time could not be saved.", L"Medication Cooldown Widget",
+            MB_OK | MB_ICONERROR);
+    }
+    schedule_refresh(window);
+    InvalidateRect(window, nullptr, FALSE);
+}
+
+void edit_medication_at(const HWND window, const std::size_t index) {
+    Medication edited = medications[index];
+    if (!edit_medication(window, edited)) return;
+    const Medication previous = medications[index];
+    medications[index] = std::move(edited);
+    try {
+        save_state();
+        enable_startup_if_needed(window);
+    } catch (const std::exception&) {
+        medications[index] = previous;
+        MessageBox(
+            window, L"The medication changes could not be saved.", L"Medication Cooldown Widget",
+            MB_OK | MB_ICONERROR);
+    }
+    rebuild_medication_icons();
+    schedule_refresh(window);
+    InvalidateRect(window, nullptr, FALSE);
+}
+
+template <typename T>
+void release(T*& value) {
+    if (!value) return;
+    value->Release();
+    value = nullptr;
+}
+
+D2D1_COLOR_F d2d_color(const COLORREF color) {
+    return D2D1::ColorF(
+        static_cast<float>(GetRValue(color)) / 255.0F,
+        static_cast<float>(GetGValue(color)) / 255.0F,
+        static_cast<float>(GetBValue(color)) / 255.0F,
+        1.0F);
+}
+
+RoundedShape aligned_shape(const RoundedShape& shape) {
+    return RoundedShape{
+        rect(
+            dips(pixels(shape.bounds.left)), dips(pixels(shape.bounds.top)),
+            dips(pixels(shape.bounds.right)), dips(pixels(shape.bounds.bottom))),
+        dips(pixels(shape.radius)),
+    };
+}
+
+RoundedShape inset_shape(const RoundedShape& shape, const float inset) {
+    return RoundedShape{
+        rect(
+            shape.bounds.left + inset, shape.bounds.top + inset,
+            shape.bounds.right - inset, shape.bounds.bottom - inset),
+        std::max(0.0F, shape.radius - inset),
+    };
+}
+
+D2D1_ROUNDED_RECT native_shape(const RoundedShape& shape) {
+    return D2D1::RoundedRect(shape.bounds, shape.radius, shape.radius);
+}
+
+bool begin_d2d(const HDC device, const RECT& bounds, ID2D1SolidColorBrush** brush) {
+    if (!d2d_factory && FAILED(D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, &d2d_factory))) {
+        return false;
+    }
+    if (!d2d_render_target) {
+        const D2D1_RENDER_TARGET_PROPERTIES properties = D2D1::RenderTargetProperties(
+            D2D1_RENDER_TARGET_TYPE_SOFTWARE,
+            D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_IGNORE),
+            static_cast<float>(widget_dpi), static_cast<float>(widget_dpi));
+        if (FAILED(d2d_factory->CreateDCRenderTarget(&properties, &d2d_render_target))) {
+            release(d2d_factory);
+            return false;
+        }
+    }
+    d2d_render_target->SetDpi(static_cast<float>(widget_dpi), static_cast<float>(widget_dpi));
+    if (FAILED(d2d_render_target->BindDC(device, &bounds))) {
+        release(d2d_render_target);
+        release(d2d_factory);
+        return false;
+    }
+    d2d_render_target->BeginDraw();
+    d2d_render_target->SetTransform(D2D1::Matrix3x2F::Identity());
+    d2d_render_target->SetAntialiasMode(D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+    if (FAILED(d2d_render_target->CreateSolidColorBrush(d2d_color(RGB(255, 255, 255)), brush))) {
+        d2d_render_target->EndDraw();
+        release(d2d_render_target);
+        release(d2d_factory);
+        return false;
+    }
+    return true;
+}
+
+void release_renderer() {
+    release(d2d_render_target);
+    release(d2d_factory);
+}
+
+bool end_d2d(const HWND window, ID2D1SolidColorBrush*& brush) {
+    release(brush);
+    const HRESULT result = d2d_render_target->EndDraw();
+    if (result == D2DERR_RECREATE_TARGET) release(d2d_render_target);
+    if (!SetTimer(window, renderer_release_timer, 50, nullptr)) release_renderer();
+    return SUCCEEDED(result);
+}
+
+void fill_shape(
+    ID2D1RenderTarget* target, ID2D1SolidColorBrush* brush,
+    const RoundedShape& logical_shape, const COLORREF color) {
+    const RoundedShape shape = aligned_shape(logical_shape);
+    brush->SetColor(d2d_color(color));
+    target->FillRoundedRectangle(native_shape(shape), brush);
+}
+
+void stroke_shape(
+    ID2D1RenderTarget* target, ID2D1SolidColorBrush* brush,
+    const RoundedShape& logical_shape, const COLORREF color, const float width = design.stroke) {
+    const RoundedShape shape = inset_shape(aligned_shape(logical_shape), width * 0.5F);
+    brush->SetColor(d2d_color(color));
+    target->DrawRoundedRectangle(native_shape(shape), brush, width);
+}
+
+void fill_gradient(
+    ID2D1RenderTarget* target, const RoundedShape& logical_shape,
+    const COLORREF top, const COLORREF bottom) {
+    const RoundedShape shape = aligned_shape(logical_shape);
+    const D2D1_GRADIENT_STOP stops[]{
+        {0.0F, d2d_color(top)},
+        {1.0F, d2d_color(bottom)},
+    };
+    ID2D1GradientStopCollection* collection{};
+    ID2D1LinearGradientBrush* brush{};
+    if (SUCCEEDED(target->CreateGradientStopCollection(stops, 2, &collection)) &&
+        SUCCEEDED(target->CreateLinearGradientBrush(
+            D2D1::LinearGradientBrushProperties(
+                D2D1::Point2F(shape.bounds.left, shape.bounds.top),
+                D2D1::Point2F(shape.bounds.left, shape.bounds.bottom)),
+            collection, &brush))) {
+        target->FillRoundedRectangle(native_shape(shape), brush);
+    }
+    release(brush);
+    release(collection);
+}
+
+void draw_action_button(const DRAWITEMSTRUCT& item) {
+    const bool taken = item.CtlID >= first_taken_button_id && item.CtlID < first_edit_button_id;
+    const bool disabled = (item.itemState & ODS_DISABLED) != 0;
+    const bool pressed = (item.itemState & ODS_SELECTED) != 0;
+    const bool hot = (item.itemState & ODS_HOTLIGHT) != 0;
+    const COLORREF fill = disabled ? RGB(45, 49, 56)
+                          : pressed ? RGB(53, 59, 70)
+                          : hot     ? RGB(69, 76, 89)
+                                    : RGB(57, 63, 74);
+    ID2D1SolidColorBrush* brush{};
+    if (begin_d2d(item.hDC, item.rcItem, &brush)) {
+        brush->SetColor(d2d_color(RGB(34, 39, 48)));
+        d2d_render_target->FillRectangle(
+            rect(0.0F, 0.0F, dips(item.rcItem.right - item.rcItem.left), dips(item.rcItem.bottom - item.rcItem.top)),
+            brush);
+        const RoundedShape circle = action_button_shape(item.hwndItem);
+        fill_shape(d2d_render_target, brush, circle, fill);
+        stroke_shape(
+            d2d_render_target, brush, circle,
+            disabled ? RGB(72, 77, 86) : hot ? RGB(119, 128, 143) : RGB(86, 94, 107));
+        if ((item.itemState & ODS_FOCUS) != 0) {
+            stroke_shape(
+                d2d_render_target, brush, inset_shape(circle, design.focus_inset - design.button_inset),
+                RGB(218, 224, 235));
+        }
+        end_d2d(GetAncestor(item.hwndItem, GA_ROOT), brush);
+    }
+
+    SetBkMode(item.hDC, TRANSPARENT);
+    SetTextColor(item.hDC, disabled ? RGB(115, 120, 130) : RGB(239, 242, 247));
+    SelectObject(item.hDC, glyph_font);
+    RECT glyph_bounds = item.rcItem;
+    const wchar_t* glyph = taken ? L"\xE73E" : L"\xE70F";
+    DrawText(item.hDC, glyph, 1, &glyph_bounds, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+}
+
+void paint_redesigned_widget(const HWND window) {
     PAINTSTRUCT paint{};
     const HDC device = BeginPaint(window, &paint);
     RECT client{};
     GetClientRect(window, &client);
+    const auto now = std::chrono::system_clock::now();
+    ID2D1SolidColorBrush* brush{};
+    if (begin_d2d(device, client, &brush)) {
+        if (medications.empty()) {
+            const RoundedShape card = empty_card_layout();
+            if (!mica_active) fill_gradient(d2d_render_target, card, RGB(40, 46, 56), RGB(24, 29, 37));
+            stroke_shape(d2d_render_target, brush, card, RGB(72, 80, 92));
+        } else {
+            for (std::size_t index = 0; index < medications.size(); ++index) {
+                const Medication& medication = medications[index];
+                const RowLayout layout = row_layout(index);
+                const std::chrono::minutes remaining = medication.remaining_at(now);
+                const bool due = medication.enabled && remaining == std::chrono::minutes::zero();
+                const bool soon = medication.is_soon_at(now);
+                const bool paused = !medication.enabled;
 
-    const HBRUSH background = CreateSolidBrush(RGB(18, 21, 27));
-    FillRect(device, &client, background);
-    DeleteObject(background);
+                if (!mica_active) {
+                    fill_gradient(
+                        d2d_render_target, layout.card,
+                        paused ? RGB(47, 49, 54) : RGB(43, 49, 59),
+                        paused ? RGB(31, 33, 37) : RGB(24, 29, 37));
+                }
+                stroke_shape(d2d_render_target, brush, layout.card, RGB(73, 81, 94));
+                fill_gradient(
+                    d2d_render_target, layout.icon_tile,
+                    paused ? RGB(72, 74, 79) : RGB(68, 75, 87),
+                    paused ? RGB(51, 53, 57) : RGB(45, 51, 61));
+                stroke_shape(d2d_render_target, brush, layout.icon_tile, RGB(91, 99, 112));
 
-    if (medications.empty()) {
-        SetBkMode(device, TRANSPARENT);
-        SetTextColor(device, RGB(174, 180, 190));
-        SelectObject(device, widget_font);
-        DrawText(device, L"Right-click to add medication", -1, &client, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+                const std::wstring state = status_text(medication, now);
+                if (!state.empty()) {
+                    const COLORREF state_accent = paused ? RGB(143, 148, 158)
+                                                  : due   ? RGB(229, 77, 83)
+                                                          : RGB(232, 169, 66);
+                    fill_shape(d2d_render_target, brush, layout.badge, RGB(35, 40, 48));
+                    stroke_shape(d2d_render_target, brush, layout.badge, state_accent);
+                }
+
+                const COLORREF accent = paused ? RGB(111, 116, 126)
+                                        : due   ? RGB(218, 64, 71)
+                                        : soon  ? RGB(221, 158, 54)
+                                                : RGB(207, 214, 224);
+                fill_shape(d2d_render_target, brush, layout.progress_bar, RGB(20, 24, 30));
+                double progress = paused ? 1.0 : 0.0;
+                if (medication.enabled && remaining > std::chrono::minutes::zero() && medication.interval.count() > 0) {
+                    progress = static_cast<double>(remaining.count()) /
+                               static_cast<double>(medication.interval.count());
+                }
+                progress = std::clamp(progress, 0.0, 1.0);
+                if (progress > 0.0) {
+                    RoundedShape progress_fill = layout.progress_bar;
+                    progress_fill.bounds.right = progress_fill.bounds.left +
+                        (progress_fill.bounds.right - progress_fill.bounds.left) * static_cast<float>(progress);
+                    progress_fill.radius = std::min(
+                        progress_fill.radius,
+                        (progress_fill.bounds.right - progress_fill.bounds.left) * 0.5F);
+                    fill_shape(d2d_render_target, brush, progress_fill, accent);
+                }
+                stroke_shape(
+                    d2d_render_target, brush, layout.progress_bar,
+                    due ? accent : RGB(81, 89, 102));
+                fill_shape(d2d_render_target, brush, layout.action_panel, RGB(34, 39, 48));
+                stroke_shape(d2d_render_target, brush, layout.action_panel, RGB(79, 87, 100));
+            }
+        }
+        if (!end_d2d(window, brush)) InvalidateRect(window, nullptr, FALSE);
     }
 
-    const auto now = std::chrono::system_clock::now();
+    SetBkMode(device, TRANSPARENT);
+
+    if (medications.empty()) {
+        SetTextColor(device, RGB(174, 180, 190));
+        SelectObject(device, dose_font);
+        DrawText(device, L"Right-click to add medication", -1, &client, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        EndPaint(window, &paint);
+        return;
+    }
+
     for (std::size_t index = 0; index < medications.size(); ++index) {
         const Medication& medication = medications[index];
-        const LONG top = scaled(row_top + static_cast<int>(index * row_step));
+        const RowLayout layout = row_layout(index);
         const std::chrono::minutes remaining = medication.remaining_at(now);
-        const bool ready = medication.enabled && remaining == std::chrono::minutes::zero();
-        const bool soon = medication.is_soon_at(now);
-
-        const HBRUSH row = CreateSolidBrush(medication.enabled ? RGB(31, 36, 45) : RGB(37, 39, 43));
-        const RECT row_bounds{scaled(12), top, scaled(408), top + scaled(row_height)};
-        FillRect(device, &row_bounds, row);
-        DeleteObject(row);
-
-        const RECT icon_bounds{scaled(22), top + scaled(14), scaled(70), top + scaled(62)};
-        const int icon_size = scaled(icon_size_dip);
+        const bool due = medication.enabled && remaining == std::chrono::minutes::zero();
+        const bool paused = !medication.enabled;
+        const RECT icon_bounds = pixel_rect(layout.icon);
+        const int icon_size = pixels(design.icon_size);
         if (index < medication_icons.size() && medication_icons[index]) {
             const HDC memory = CreateCompatibleDC(device);
             const HGDIOBJ previous = SelectObject(memory, medication_icons[index]);
-            const BLENDFUNCTION blend{AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
+            const BLENDFUNCTION blend{AC_SRC_OVER, 0, static_cast<BYTE>(paused ? 150 : 255), AC_SRC_ALPHA};
             AlphaBlend(
                 device, icon_bounds.left, icon_bounds.top, icon_size, icon_size, memory, 0, 0, icon_size, icon_size,
                 blend);
             SelectObject(memory, previous);
             DeleteDC(memory);
-        } else {
-            const HBRUSH icon = CreateSolidBrush(medication.enabled ? RGB(66, 82, 110) : RGB(72, 74, 78));
-            FillRect(device, &icon_bounds, icon);
-            DeleteObject(icon);
-            if (!medication.name.empty()) {
-                SetBkMode(device, TRANSPARENT);
-                SetTextColor(device, RGB(239, 242, 247));
-                SelectObject(device, widget_font_bold);
-                const wchar_t initial[]{medication.name.front(), L'\0'};
-                RECT initial_bounds = icon_bounds;
-                DrawText(device, initial, 1, &initial_bounds, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-            }
+        } else if (!medication.name.empty()) {
+            SetTextColor(device, paused ? RGB(173, 176, 182) : RGB(239, 242, 247));
+            SelectObject(device, initial_font);
+            const wchar_t initial[]{medication.name.front(), L'\0'};
+            RECT initial_bounds = pixel_rect(layout.icon_tile.bounds);
+            DrawText(device, initial, 1, &initial_bounds, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         }
 
-        SetBkMode(device, TRANSPARENT);
-        SetTextColor(device, RGB(239, 242, 247));
-        SelectObject(device, widget_font_bold);
-        RECT name_bounds{scaled(82), top + scaled(8), scaled(210), top + scaled(29)};
-        const std::wstring label = medication.name + (medication.dose.empty() ? L"" : L"  " + medication.dose);
-        DrawText(device, label.c_str(), -1, &name_bounds, DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS);
+        const std::wstring state = status_text(medication, now);
+        RECT name_bounds = pixel_rect(state.empty() ? layout.name_without_state : layout.name_with_state);
+        SetTextColor(device, paused ? RGB(191, 195, 202) : RGB(242, 244, 248));
+        SelectObject(device, name_font);
+        DrawText(device, medication.name.c_str(), -1, &name_bounds, DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS);
 
-        const std::wstring status = status_text(medication, now);
-        SetTextColor(
-            device, !medication.enabled ? RGB(166, 171, 180)
-                    : ready             ? RGB(104, 218, 142)
-                    : soon              ? RGB(240, 178, 72)
-                                        : RGB(205, 211, 221));
-        RECT status_bounds{scaled(212), top + scaled(8), scaled(312), top + scaled(29)};
-        DrawText(device, status.c_str(), -1, &status_bounds, DT_RIGHT | DT_SINGLELINE);
+        RECT dose_bounds = pixel_rect(layout.dose);
+        SetTextColor(device, RGB(169, 176, 188));
+        SelectObject(device, dose_font);
+        DrawText(device, medication.dose.c_str(), -1, &dose_bounds, DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS);
 
-        const RECT bar_bounds{scaled(82), top + scaled(34), scaled(312), top + scaled(47)};
-        const HBRUSH bar_background = CreateSolidBrush(RGB(11, 13, 17));
-        FillRect(device, &bar_bounds, bar_background);
-        DeleteObject(bar_background);
-
-        double progress = medication.enabled ? 0.0 : 1.0;
-        if (medication.enabled && remaining > std::chrono::minutes::zero() && medication.interval.count() > 0) {
-            progress = static_cast<double>(remaining.count()) / static_cast<double>(medication.interval.count());
+        if (!state.empty()) {
+            RECT badge = pixel_rect(layout.badge.bounds);
+            const COLORREF state_accent = paused ? RGB(143, 148, 158)
+                                          : due   ? RGB(229, 77, 83)
+                                                  : RGB(232, 169, 66);
+            SetTextColor(device, state_accent);
+            SelectObject(device, status_font);
+            DrawText(device, state.c_str(), -1, &badge, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         }
-        RECT progress_bounds = bar_bounds;
-        progress_bounds.right =
-            progress_bounds.left + static_cast<LONG>(scaled(230) * std::clamp(progress, 0.0, 1.0));
-        const HBRUSH progress_brush = CreateSolidBrush(!medication.enabled                               ? RGB(80, 82, 86)
-                                                       : ready ? RGB(49, 145, 83)
-                                                       : soon  ? RGB(190, 119, 31)
-                                                               : RGB(55, 104, 178));
-        FillRect(device, &progress_bounds, progress_brush);
-        DeleteObject(progress_brush);
 
-        SelectObject(device, widget_font_bold);
-        SetTextColor(device, RGB(239, 242, 247));
-        RECT countdown_bounds = bar_bounds;
-        countdown_bounds.right -= scaled(4);
-        const std::wstring countdown = countdown_text(medication, now);
+        RECT bar_text = pixel_rect(layout.progress_text);
+        const std::wstring text = hovered_bar == index ? local_timestamp_text(medication, now)
+                                                       : countdown_text(medication, now);
+        SetTextColor(device, due ? RGB(244, 104, 110) : RGB(240, 243, 248));
+        SelectObject(device, countdown_font);
         DrawText(
-            device, countdown.c_str(), -1, &countdown_bounds,
+            device, text.c_str(), -1, &bar_text,
             DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
-
-        SelectObject(device, widget_font);
-        SetTextColor(device, RGB(166, 171, 180));
-        RECT timestamp_bounds{scaled(82), top + scaled(52), scaled(312), top + scaled(70)};
-        const std::wstring timestamp = local_timestamp_text(medication, now);
-        DrawText(device, timestamp.c_str(), -1, &timestamp_bounds, DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS);
     }
 
     EndPaint(window, &paint);
@@ -721,7 +1209,9 @@ LRESULT CALLBACK window_procedure(const HWND window, const UINT message, const W
 
     switch (message) {
     case WM_CREATE:
-        if (!create_taken_buttons(window)) return -1;
+        if (!create_action_buttons(window)) return -1;
+        apply_widget_region(window);
+        apply_background_material(window);
         if (!add_tray_icon(window)) {
             MessageBox(
                 window, L"The system tray icon could not be created.", L"Medication Cooldown Widget",
@@ -737,24 +1227,27 @@ LRESULT CALLBACK window_procedure(const HWND window, const UINT message, const W
         }
         return 0;
     case WM_COMMAND: {
-        const int index = LOWORD(w_param) - first_taken_button_id;
-        if (HIWORD(w_param) == BN_CLICKED && index >= 0 && static_cast<std::size_t>(index) < medications.size()) {
-            Medication& medication = medications[static_cast<std::size_t>(index)];
-            const auto previous = medication.last_taken_at;
-            medication.mark_taken(std::chrono::system_clock::now());
-            try {
-                save_state();
-                enable_startup_if_needed(window);
-            } catch (const std::exception&) {
-                medication.last_taken_at = previous;
-                MessageBox(window, L"The medication time could not be saved.", L"Medication Cooldown Widget", MB_OK | MB_ICONERROR);
-            }
-            schedule_refresh(window);
-            InvalidateRect(window, nullptr, FALSE);
+        const int taken_index = LOWORD(w_param) - first_taken_button_id;
+        const int edit_index = LOWORD(w_param) - first_edit_button_id;
+        if (HIWORD(w_param) == BN_CLICKED && taken_index >= 0 &&
+            static_cast<std::size_t>(taken_index) < medications.size()) {
+            mark_medication_taken(window, static_cast<std::size_t>(taken_index));
+            return 0;
+        }
+        if (HIWORD(w_param) == BN_CLICKED && edit_index >= 0 &&
+            static_cast<std::size_t>(edit_index) < medications.size()) {
+            edit_medication_at(window, static_cast<std::size_t>(edit_index));
             return 0;
         }
         break;
     }
+    case WM_DRAWITEM:
+        if (w_param >= first_taken_button_id &&
+            w_param < first_edit_button_id + static_cast<WPARAM>(medications.size())) {
+            draw_action_button(*reinterpret_cast<const DRAWITEMSTRUCT*>(l_param));
+            return TRUE;
+        }
+        break;
     case WM_CONTEXTMENU: {
         POINT point{
             static_cast<LONG>(static_cast<short>(LOWORD(l_param))),
@@ -764,7 +1257,7 @@ LRESULT CALLBACK window_procedure(const HWND window, const UINT message, const W
         if (point.x == -1 && point.y == -1) {
             RECT bounds{};
             GetWindowRect(window, &bounds);
-            point = POINT{bounds.left + scaled(82), bounds.top + scaled(row_top + 20)};
+            point = POINT{bounds.left + scaled(82), bounds.top + scaled(20)};
         }
 
         const HMENU menu = CreatePopupMenu();
@@ -784,28 +1277,24 @@ LRESULT CALLBACK window_procedure(const HWND window, const UINT message, const W
         AppendMenu(
             menu, MF_STRING | (widget_settings.always_on_top ? MF_CHECKED : MF_UNCHECKED),
             always_on_top_command, L"Always on top");
+        const HMENU material_menu = CreatePopupMenu();
+        if (material_menu) {
+            AppendMenu(
+                material_menu,
+                MF_STRING | (widget_settings.background_material == BackgroundMaterial::solid ? MF_CHECKED : 0),
+                solid_material_command, L"Solid");
+            AppendMenu(
+                material_menu,
+                MF_STRING | (widget_settings.background_material == BackgroundMaterial::mica ? MF_CHECKED : 0),
+                mica_material_command, L"Mica");
+            AppendMenu(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(material_menu), L"Background material");
+        }
         SetForegroundWindow(window);
         const UINT command = TrackPopupMenu(
             menu, TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON, point.x, point.y, 0, window, nullptr);
         DestroyMenu(menu);
         if (command == edit_medication_command && index) {
-            Medication edited = medications[*index];
-            if (edit_medication(window, edited)) {
-                const Medication previous = medications[*index];
-                medications[*index] = std::move(edited);
-                try {
-                    save_state();
-                    enable_startup_if_needed(window);
-                } catch (const std::exception&) {
-                    medications[*index] = previous;
-                    MessageBox(
-                        window, L"The medication changes could not be saved.", L"Medication Cooldown Widget",
-                        MB_OK | MB_ICONERROR);
-                }
-                rebuild_medication_icons();
-                schedule_refresh(window);
-                InvalidateRect(window, nullptr, FALSE);
-            }
+            edit_medication_at(window, *index);
         } else if (command == add_medication_command) {
             Medication added{.interval = std::chrono::hours{24}};
             if (edit_medication(window, added)) {
@@ -887,6 +1376,23 @@ LRESULT CALLBACK window_procedure(const HWND window, const UINT message, const W
                     window, L"The always-on-top setting could not be saved.", L"Medication Cooldown Widget",
                     MB_OK | MB_ICONERROR);
             }
+        } else if (command == solid_material_command || command == mica_material_command) {
+            const BackgroundMaterial selected =
+                command == mica_material_command ? BackgroundMaterial::mica : BackgroundMaterial::solid;
+            if (selected != widget_settings.background_material) {
+                const BackgroundMaterial previous = widget_settings.background_material;
+                widget_settings.background_material = selected;
+                apply_background_material(window);
+                try {
+                    save_state();
+                } catch (const std::exception&) {
+                    widget_settings.background_material = previous;
+                    apply_background_material(window);
+                    MessageBox(
+                        window, L"The background material setting could not be saved.",
+                        L"Medication Cooldown Widget", MB_OK | MB_ICONERROR);
+                }
+            }
         }
         return 0;
     }
@@ -899,6 +1405,29 @@ LRESULT CALLBACK window_procedure(const HWND window, const UINT message, const W
             ClientToScreen(window, &point);
             ReleaseCapture();
             SendMessage(window, WM_NCLBUTTONDOWN, HTCAPTION, MAKELPARAM(point.x, point.y));
+        }
+        return 0;
+    case WM_MOUSEMOVE: {
+        if (!tracking_mouse_leave) {
+            TRACKMOUSEEVENT tracking{sizeof(TRACKMOUSEEVENT), TME_LEAVE, window, 0};
+            tracking_mouse_leave = TrackMouseEvent(&tracking) != FALSE;
+        }
+        const POINT point{
+            static_cast<LONG>(static_cast<short>(LOWORD(l_param))),
+            static_cast<LONG>(static_cast<short>(HIWORD(l_param))),
+        };
+        const auto next_hover = progress_bar_at(point);
+        if (next_hover != hovered_bar) {
+            hovered_bar = next_hover;
+            InvalidateRect(window, nullptr, FALSE);
+        }
+        return 0;
+    }
+    case WM_MOUSELEAVE:
+        tracking_mouse_leave = false;
+        if (hovered_bar) {
+            hovered_bar.reset();
+            InvalidateRect(window, nullptr, FALSE);
         }
         return 0;
     case WM_KEYDOWN:
@@ -926,9 +1455,13 @@ LRESULT CALLBACK window_procedure(const HWND window, const UINT message, const W
     case WM_DPICHANGED: {
         widget_dpi = HIWORD(w_param);
         while (const HWND child = GetWindow(window, GW_CHILD)) DestroyWindow(child);
+        if (tooltip_window) DestroyWindow(tooltip_window);
+        tooltip_window = nullptr;
+        hovered_bar.reset();
+        tracking_mouse_leave = false;
         rebuild_fonts();
         rebuild_medication_icons();
-        if (!create_taken_buttons(window)) {
+        if (!create_action_buttons(window)) {
             DestroyWindow(window);
             return 0;
         }
@@ -937,12 +1470,19 @@ LRESULT CALLBACK window_procedure(const HWND window, const UINT message, const W
         SetWindowPos(
             window, nullptr, position.x, position.y, widget_width(), widget_height(),
             SWP_NOZORDER | SWP_NOACTIVATE);
+        apply_widget_region(window);
+        apply_background_material(window);
         persist_window_position(window, false);
         schedule_refresh(window);
         InvalidateRect(window, nullptr, FALSE);
         return 0;
     }
     case WM_TIMER:
+        if (w_param == renderer_release_timer) {
+            KillTimer(window, renderer_release_timer);
+            release_renderer();
+            return 0;
+        }
         if (w_param == refresh_timer) {
             schedule_refresh(window);
             InvalidateRect(window, nullptr, FALSE);
@@ -950,12 +1490,14 @@ LRESULT CALLBACK window_procedure(const HWND window, const UINT message, const W
         }
         break;
     case WM_PAINT:
-        paint_widget(window);
+        paint_redesigned_widget(window);
         return 0;
     case WM_ERASEBKGND:
         return 1;
     case WM_DESTROY:
         KillTimer(window, refresh_timer);
+        KillTimer(window, renderer_release_timer);
+        release_renderer();
         remove_tray_icon(window);
         clear_medication_icons();
         PostQuitMessage(0);
@@ -974,21 +1516,29 @@ int WINAPI wWinMain(const HINSTANCE instance, HINSTANCE, PWSTR, const int show_c
         bool uninitialize;
         ~ComCleanup() {
             clear_medication_icons();
-            if (widget_font) DeleteObject(widget_font);
-            if (widget_font_bold) DeleteObject(widget_font_bold);
+            release(d2d_render_target);
+            release(d2d_factory);
+            if (name_font) DeleteObject(name_font);
+            if (dose_font) DeleteObject(dose_font);
+            if (status_font) DeleteObject(status_font);
+            if (countdown_font) DeleteObject(countdown_font);
+            if (initial_font) DeleteObject(initial_font);
+            if (glyph_font) DeleteObject(glyph_font);
             if (imaging_factory) imaging_factory->Release();
             if (uninitialize) CoUninitialize();
         }
     } cleanup{SUCCEEDED(com_result)};
     widget_dpi = system_dpi();
     rebuild_fonts();
+    if (FAILED(D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, &d2d_factory))) return 1;
     if (SUCCEEDED(com_result) || com_result == RPC_E_CHANGED_MODE) {
         CoCreateInstance(
             CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_IWICImagingFactory,
             reinterpret_cast<void**>(&imaging_factory));
     }
 
-    const INITCOMMONCONTROLSEX common_controls{sizeof(INITCOMMONCONTROLSEX), ICC_DATE_CLASSES};
+    const INITCOMMONCONTROLSEX common_controls{
+        sizeof(INITCOMMONCONTROLSEX), ICC_DATE_CLASSES | ICC_WIN95_CLASSES};
     if (!InitCommonControlsEx(&common_controls)) return 1;
 
     bool configuration_missing{};

@@ -64,6 +64,7 @@ int main() {
         .window_y = 150,
         .position_locked = true,
         .always_on_top = true,
+        .background_material = BackgroundMaterial::mica,
     };
     save_medications(json_path, std::vector{medication, second}, settings);
 
@@ -84,6 +85,7 @@ int main() {
     CHECK(loaded_settings.window_y == settings.window_y);
     CHECK(loaded_settings.position_locked);
     CHECK(loaded_settings.always_on_top);
+    CHECK(loaded_settings.background_material == BackgroundMaterial::mica);
 
     std::ifstream json(json_path);
     const std::string text{std::istreambuf_iterator<char>{json}, std::istreambuf_iterator<char>{}};
@@ -131,5 +133,13 @@ int main() {
     CHECK(!loaded_settings.window_y);
     CHECK(!loaded_settings.position_locked);
     CHECK(!loaded_settings.always_on_top);
+    CHECK(loaded_settings.background_material == BackgroundMaterial::solid);
+
+    std::ofstream legacy_settings(json_path, std::ios::trunc);
+    legacy_settings << R"({"medications": [], "settings": {"window_x": null, "window_y": null, "position_locked": false, "always_on_top": false}})" << '\n';
+    legacy_settings.close();
+    loaded_settings.background_material = BackgroundMaterial::mica;
+    CHECK(load_medications(json_path, &loaded_settings).empty());
+    CHECK(loaded_settings.background_material == BackgroundMaterial::solid);
     std::filesystem::remove(json_path);
 }

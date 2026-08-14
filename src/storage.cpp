@@ -347,6 +347,15 @@ std::optional<int> optional_setting_integer(const JsonValue::Object& object, con
     if (std::holds_alternative<std::nullptr_t>(value.value)) return std::nullopt;
     return setting_integer(object, name);
 }
+
+BackgroundMaterial background_material_from_json(const JsonValue::Object& object) {
+    const auto found = object.find("background_material");
+    if (found == object.end()) return BackgroundMaterial::solid;
+    const std::string& value = as<std::string>(found->second, "background_material");
+    if (value == "solid") return BackgroundMaterial::solid;
+    if (value == "mica") return BackgroundMaterial::mica;
+    throw std::runtime_error("Medication JSON setting 'background_material' is invalid");
+}
 }
 
 std::vector<Medication> load_medications(const std::filesystem::path& path, WidgetSettings* settings) {
@@ -366,6 +375,7 @@ std::vector<Medication> load_medications(const std::filesystem::path& path, Widg
             settings->window_y = optional_setting_integer(object, "window_y");
             settings->position_locked = as<bool>(required(object, "position_locked"), "position_locked");
             settings->always_on_top = as<bool>(required(object, "always_on_top"), "always_on_top");
+            settings->background_material = background_material_from_json(object);
         }
     }
     const auto& values = as<JsonValue::Array>(required(root, "medications"), "medications");
@@ -408,7 +418,9 @@ void save_medications(
     if (settings.window_y) output << *settings.window_y;
     else output << "null";
     output << ",\n    \"position_locked\": " << (settings.position_locked ? "true" : "false") << ",\n"
-           << "    \"always_on_top\": " << (settings.always_on_top ? "true" : "false") << "\n"
+           << "    \"always_on_top\": " << (settings.always_on_top ? "true" : "false") << ",\n"
+           << "    \"background_material\": \""
+           << (settings.background_material == BackgroundMaterial::mica ? "mica" : "solid") << "\"\n"
            << "  }\n}\n";
     output.flush();
     if (!output) {
