@@ -30,10 +30,18 @@ namespace {
 constexpr wchar_t window_class[] = L"MedAurasWindow";
 constexpr UINT_PTR refresh_timer = 1;
 constexpr UINT_PTR renderer_release_timer = 2;
+constexpr UINT_PTR icon_fade_timer = 3;
+constexpr UINT_PTR focus_fade_timer = 4;
 constexpr int first_taken_button_id = 100;
-constexpr int first_edit_button_id = 200;
+// Bounded hover transition for the icon tile's edit affordance. The timer runs only while a fade is
+// in flight and kills itself on arrival, so idle behaviour is unchanged.
+constexpr UINT icon_fade_interval_ms = 16;
+constexpr float icon_fade_step = 0.15F;
+// A pointer-driven focus ring fades away once shown. Keyboard focus keeps its ring, which stays
+// visible for as long as the control holds focus.
+constexpr float focus_fade_step = 0.08F;
 struct DesignTokens {
-    float widget_width{400.0F};
+    float widget_width{364.0F};
     float empty_height{60.0F};
     // Vertical rhythm: padding, the name/dose line, a gap, the progress bar, then bottom padding.
     // row_height is the sum of those, so changing any one keeps the card evenly spaced. The bottom
@@ -62,9 +70,7 @@ struct DesignTokens {
     float info_left_inset{3.0F};
     float action_area_left{312.0F};
     float action_button_padding{5.0F};
-    float action_button_gap{8.0F};
     float taken_button_size{36.0F};
-    float edit_button_size{28.0F};
     float button_inset{1.0F};
     float focus_inset{4.0F};
 };
@@ -123,6 +129,18 @@ bool tray_icon_added{};
 UINT taskbar_created_message{};
 HWND tooltip_window{};
 std::optional<std::size_t> hovered_bar;
+// The icon tile doubles as the edit affordance. hovered_icon is the tile under the cursor;
+// fading_icon is the tile the current transition applies to, which outlives the hover while the
+// glyph fades back out.
+std::optional<std::size_t> hovered_icon;
+std::optional<std::size_t> fading_icon;
+float icon_fade{};
+// Hover is tracked here rather than read back from BM_GETSTATE, so the hot visual does not depend
+// on the control reporting a hot state we never see it enter.
+std::optional<std::size_t> hovered_button;
+std::optional<std::size_t> focus_ring_button;
+float focus_ring_fade{};
+bool focus_from_pointer{};
 bool tracking_mouse_leave{};
 
 float dpi_scale() {
@@ -656,7 +674,6 @@ struct RowLayout {
     RoundedShape progress_bar;
     D2D1_RECT_F progress_text;
     RoundedShape taken_button;
-    RoundedShape edit_button;
 };
 
 D2D1_RECT_F rect(const float left, const float top, const float right, const float bottom) {
@@ -676,8 +693,6 @@ RowLayout row_layout(const std::size_t index) {
     const float top = static_cast<float>(index) * (design.row_height + design.row_gap);
     const float taken_left = design.action_area_left + design.action_button_padding;
     const float taken_top = top + (design.row_height - design.taken_button_size) * 0.5F;
-    const float edit_left = taken_left + design.taken_button_size + design.action_button_gap;
-    const float edit_top = top + (design.row_height - design.edit_button_size) * 0.5F;
     const float info_top = top + design.row_padding;
     const float info_bottom = info_top + design.info_height;
     const float progress_top = info_bottom + design.info_progress_gap;
@@ -705,9 +720,6 @@ RowLayout row_layout(const std::size_t index) {
         .taken_button = capsule(
             taken_left, taken_top, taken_left + design.taken_button_size,
             taken_top + design.taken_button_size),
-        .edit_button = capsule(
-            edit_left, edit_top, edit_left + design.edit_button_size,
-            edit_top + design.edit_button_size),
     };
 }
 
@@ -749,16 +761,68 @@ void invalidate_progress_bar(const HWND window, const std::optional<std::size_t>
     InvalidateRect(window, &bounds, FALSE);
 }
 
+void invalidate_icon_tile(const HWND window, const std::optional<std::size_t> index) {
+    if (!index || *index >= medications.size()) return;
+    RECT bounds = pixel_rect(row_layout(*index).icon_tile.bounds);
+    InflateRect(&bounds, 1, 1);
+    InvalidateRect(window, &bounds, FALSE);
+}
+
+std::optional<std::size_t> icon_tile_at(const POINT client_point) {
+    const D2D1_POINT_2F dip_point = D2D1::Point2F(dips(client_point.x), dips(client_point.y));
+    for (std::size_t index = 0; index < medications.size(); ++index) {
+        if (contains(row_layout(index).icon_tile, dip_point)) return index;
+    }
+    return std::nullopt;
+}
+
+// Steps the hover fade one frame and stops the timer once it settles, so a resting widget owns no
+// periodic work.
+void advance_icon_fade(const HWND window) {
+    const bool rising = hovered_icon && fading_icon && *hovered_icon == *fading_icon;
+    icon_fade = rising ? std::min(1.0F, icon_fade + icon_fade_step)
+                       : std::max(0.0F, icon_fade - icon_fade_step);
+    invalidate_icon_tile(window, fading_icon);
+    if ((rising && icon_fade >= 1.0F) || (!rising && icon_fade <= 0.0F)) {
+        KillTimer(window, icon_fade_timer);
+        if (!rising) fading_icon.reset();
+    }
+}
+
+void set_hovered_icon(const HWND window, const std::optional<std::size_t> index) {
+    if (hovered_icon == index) return;
+    const std::optional<std::size_t> previous = fading_icon;
+    hovered_icon = index;
+    if (index) {
+        // Switching straight from one tile to another restarts rather than carrying the old value.
+        if (fading_icon != index) icon_fade = 0.0F;
+        fading_icon = index;
+        invalidate_icon_tile(window, previous);
+    }
+    invalidate_icon_tile(window, fading_icon);
+    if (!SetTimer(window, icon_fade_timer, icon_fade_interval_ms, nullptr)) {
+        // Without a timer, settle immediately rather than leaving a half-drawn glyph.
+        icon_fade = index ? 1.0F : 0.0F;
+        if (!index) fading_icon.reset();
+        invalidate_icon_tile(window, index ? index : previous);
+    }
+}
+
+COLORREF blend_color(const COLORREF from, const COLORREF to, const float amount) {
+    const auto mix = [amount](const int a, const int b) {
+        return static_cast<int>(static_cast<float>(a) + (static_cast<float>(b - a) * amount));
+    };
+    return RGB(
+        mix(GetRValue(from), GetRValue(to)), mix(GetGValue(from), GetGValue(to)),
+        mix(GetBValue(from), GetBValue(to)));
+}
+
 std::optional<std::size_t> medication_at(const HWND window, POINT point) {
     if (point.x == -1 && point.y == -1) {
         const int focused_id = GetDlgCtrlID(GetFocus());
         const int taken_index = focused_id - first_taken_button_id;
-        const int edit_index = focused_id - first_edit_button_id;
         if (taken_index >= 0 && static_cast<std::size_t>(taken_index) < medications.size()) {
             return static_cast<std::size_t>(taken_index);
-        }
-        if (edit_index >= 0 && static_cast<std::size_t>(edit_index) < medications.size()) {
-            return static_cast<std::size_t>(edit_index);
         }
         return medications.empty() ? std::nullopt : std::optional<std::size_t>{0};
     }
@@ -791,9 +855,48 @@ RoundedShape action_button_shape(const HWND button) {
         std::max(0.0F, std::min(width, height) * 0.5F - inset));
 }
 
+// A layered window presents only the bitmap published by UpdateLayeredWindow, so the child button
+// repainting itself is never seen. Its hover, pressed, and focus states live in the composed frame,
+// which means the parent has to be invalidated whenever that state changes.
+void invalidate_action_button(const HWND button) {
+    const HWND parent = GetAncestor(button, GA_ROOT);
+    if (!parent) return;
+    const int index = GetDlgCtrlID(button) - first_taken_button_id;
+    if (index < 0 || static_cast<std::size_t>(index) >= medications.size()) return;
+    RECT bounds = pixel_rect(row_layout(static_cast<std::size_t>(index)).taken_button.bounds);
+    InflateRect(&bounds, pixels(design.focus_inset) + 1, pixels(design.focus_inset) + 1);
+    InvalidateRect(parent, &bounds, FALSE);
+}
+
+// Decays a pointer-driven focus ring and stops once it is gone, so holding focus costs nothing.
+void advance_focus_fade(const HWND window) {
+    focus_ring_fade = std::max(0.0F, focus_ring_fade - focus_fade_step);
+    if (focus_ring_button) {
+        RECT bounds = pixel_rect(row_layout(*focus_ring_button).taken_button.bounds);
+        InflateRect(&bounds, pixels(design.focus_inset) + 1, pixels(design.focus_inset) + 1);
+        InvalidateRect(window, &bounds, FALSE);
+    }
+    if (focus_ring_fade <= 0.0F) KillTimer(window, focus_fade_timer);
+}
+
+std::optional<std::size_t> action_button_index(const HWND button) {
+    const int index = GetDlgCtrlID(button) - first_taken_button_id;
+    if (index < 0 || static_cast<std::size_t>(index) >= medications.size()) return std::nullopt;
+    return static_cast<std::size_t>(index);
+}
+
+// BM_GETSTATE covers pressed and focus. Enablement and our own hover flag are folded in so any
+// visible state change is detected, including ones the control does not report.
+DWORD_PTR action_button_state(const HWND button) {
+    const auto state = static_cast<DWORD_PTR>(SendMessage(button, BM_GETSTATE, 0, 0));
+    const auto index = action_button_index(button);
+    const bool hot = index && hovered_button == index;
+    return state | (IsWindowEnabled(button) ? 0x10000U : 0U) | (hot ? 0x20000U : 0U);
+}
+
 LRESULT CALLBACK action_button_procedure(
     const HWND button, const UINT message, const WPARAM w_param, const LPARAM l_param,
-    UINT_PTR, DWORD_PTR) {
+    UINT_PTR, const DWORD_PTR reference_data) {
     if (message == WM_NCHITTEST) {
         POINT point{
             static_cast<LONG>(static_cast<short>(LOWORD(l_param))),
@@ -805,6 +908,53 @@ LRESULT CALLBACK action_button_procedure(
         }
     } else if (message == WM_NCDESTROY) {
         RemoveWindowSubclass(button, action_button_procedure, 1);
+    } else if (message == WM_SETCURSOR && LOWORD(l_param) == HTCLIENT) {
+        // WM_NCHITTEST already rejects everything outside the circle, so reaching here means the
+        // pointer is over the clickable area.
+        SetCursor(LoadCursor(nullptr, IDC_HAND));
+        return TRUE;
+    } else if (
+        message == WM_MOUSEMOVE || message == WM_MOUSELEAVE || message == WM_LBUTTONDOWN ||
+        message == WM_LBUTTONUP || message == WM_SETFOCUS || message == WM_KILLFOCUS ||
+        message == WM_ENABLE || message == WM_KEYDOWN || message == WM_KEYUP) {
+        if (message == WM_MOUSEMOVE) {
+            TRACKMOUSEEVENT tracking{sizeof(TRACKMOUSEEVENT), TME_LEAVE, button, 0};
+            static_cast<void>(TrackMouseEvent(&tracking));
+            hovered_button = action_button_index(button);
+        } else if (message == WM_MOUSELEAVE && hovered_button == action_button_index(button)) {
+            hovered_button.reset();
+        } else if (message == WM_LBUTTONDOWN) {
+            // Set before the control takes focus, so WM_SETFOCUS can tell a click from a Tab.
+            focus_from_pointer = true;
+        } else if (message == WM_SETFOCUS) {
+            focus_ring_button = action_button_index(button);
+            focus_ring_fade = 1.0F;
+            const HWND parent = GetAncestor(button, GA_ROOT);
+            if (focus_from_pointer && parent) {
+                // Keyboard focus keeps its ring; a clicked ring shows once and recedes.
+                if (!SetTimer(parent, focus_fade_timer, icon_fade_interval_ms, nullptr)) {
+                    focus_ring_fade = 0.0F;
+                }
+            }
+            focus_from_pointer = false;
+        } else if (message == WM_KILLFOCUS) {
+            if (focus_ring_button == action_button_index(button)) {
+                focus_ring_button.reset();
+                focus_ring_fade = 0.0F;
+                if (const HWND parent = GetAncestor(button, GA_ROOT)) {
+                    KillTimer(parent, focus_fade_timer);
+                }
+            }
+        }
+        // Let the control update BM_GETSTATE first, then repaint only if it actually changed.
+        // Repainting on every mouse move would republish the whole layered frame continuously.
+        const LRESULT result = DefSubclassProc(button, message, w_param, l_param);
+        const DWORD_PTR state = action_button_state(button);
+        if (state != reference_data) {
+            SetWindowSubclass(button, action_button_procedure, 1, state);
+            invalidate_action_button(button);
+        }
+        return result;
     }
     return DefSubclassProc(button, message, w_param, l_param);
 }
@@ -822,22 +972,13 @@ bool create_action_buttons(const HWND window) {
             taken.left, taken.top, taken.right - taken.left, taken.bottom - taken.top, window,
             reinterpret_cast<HMENU>(static_cast<INT_PTR>(first_taken_button_id + static_cast<int>(index))),
             GetModuleHandle(nullptr), nullptr);
-        const RECT edit = pixel_rect(layout.edit_button.bounds);
-        const HWND edit_button = CreateWindow(
-            L"BUTTON", L"Edit medication", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
-            edit.left, edit.top, edit.right - edit.left, edit.bottom - edit.top, window,
-            reinterpret_cast<HMENU>(static_cast<INT_PTR>(first_edit_button_id + static_cast<int>(index))),
-            GetModuleHandle(nullptr), nullptr);
-        if (!taken_button || !edit_button) return false;
-        if (!SetWindowSubclass(taken_button, action_button_procedure, 1, 0) ||
-            !SetWindowSubclass(edit_button, action_button_procedure, 1, 0)) {
+        if (!taken_button) return false;
+        if (!SetWindowSubclass(
+                taken_button, action_button_procedure, 1, action_button_state(taken_button))) {
             return false;
         }
         EnableWindow(taken_button, medications[index].enabled);
-        if (tooltip_window) {
-            static_cast<void>(add_button_tooltip(taken_button, L"Taken"));
-            static_cast<void>(add_button_tooltip(edit_button, L"Edit medication"));
-        }
+        if (tooltip_window) static_cast<void>(add_button_tooltip(taken_button, L"Taken"));
     }
     return true;
 }
@@ -1033,7 +1174,8 @@ struct ButtonVisualState {
     bool disabled;
     bool pressed;
     bool hot;
-    bool focused;
+    // 1 while the ring is fully shown, decaying to 0 when focus arrived by pointer.
+    float focus_fade;
 };
 
 void draw_action_button_geometry(
@@ -1050,20 +1192,21 @@ void draw_action_button_geometry(
     stroke_shape(
         target, brush, circle,
         disabled ? border_hairline : hot ? border_strong : surface_elevated);
-    if (state.focused) {
+    if (state.focus_fade > 0.0F) {
+        // Fading toward the button fill rather than toggling off, so a click-focused ring recedes
+        // instead of vanishing after a delay.
         stroke_shape(
             target, brush, inset_shape(circle, design.focus_inset - design.button_inset),
-            focus_ring);
+            blend_color(fill, focus_ring, state.focus_fade));
     }
 }
 
 void draw_action_button(const DRAWITEMSTRUCT& item) {
-    const bool taken = item.CtlID >= first_taken_button_id && item.CtlID < first_edit_button_id;
     const ButtonVisualState state{
         .disabled = (item.itemState & ODS_DISABLED) != 0,
         .pressed = (item.itemState & ODS_SELECTED) != 0,
         .hot = (item.itemState & ODS_HOTLIGHT) != 0,
-        .focused = (item.itemState & ODS_FOCUS) != 0,
+        .focus_fade = (item.itemState & ODS_FOCUS) != 0 ? 1.0F : 0.0F,
     };
     ID2D1SolidColorBrush* brush{};
     if (begin_d2d(item.hDC, item.rcItem, &brush)) {
@@ -1080,17 +1223,18 @@ void draw_action_button(const DRAWITEMSTRUCT& item) {
     SetTextColor(item.hDC, state.disabled ? text_muted : text_primary);
     SelectObject(item.hDC, glyph_font);
     RECT glyph_bounds = item.rcItem;
-    const wchar_t* glyph = taken ? L"\xE73E" : L"\xE70F";
-    DrawText(item.hDC, glyph, 1, &glyph_bounds, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    DrawText(item.hDC, L"\xE73E", 1, &glyph_bounds, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
 }
 
 ButtonVisualState button_visual_state(const HWND button) {
     const LRESULT state = SendMessage(button, BM_GETSTATE, 0, 0);
+    const auto index = action_button_index(button);
+    const bool focused = GetFocus() == button;
     return ButtonVisualState{
         .disabled = !IsWindowEnabled(button),
         .pressed = (state & BST_PUSHED) != 0,
-        .hot = (state & BST_HOT) != 0,
-        .focused = GetFocus() == button,
+        .hot = (index && hovered_button == index) || (state & BST_HOT) != 0,
+        .focus_fade = focused && focus_ring_button == index ? focus_ring_fade : 0.0F,
     };
 }
 
@@ -1119,10 +1263,16 @@ void render_redesigned_widget(
                     paused ? surface_raised_paused : surface_raised,
                     paused ? surface_base_paused : surface_base);
                 stroke_shape(d2d_render_target, brush, layout.card, border_hairline);
+                // The tile is the edit affordance, so it lights to the same hot surface as the
+                // action button. It rides the pencil's fade so both arrive together.
+                const float tile_fade = fading_icon && *fading_icon == index ? icon_fade : 0.0F;
+                const COLORREF tile_base = paused ? surface_raised_paused : surface_raised;
                 fill_shape(
                     d2d_render_target, brush, layout.icon_tile,
-                    paused ? surface_raised_paused : surface_raised);
-                stroke_shape(d2d_render_target, brush, layout.icon_tile, border_hairline);
+                    blend_color(tile_base, surface_elevated, tile_fade));
+                stroke_shape(
+                    d2d_render_target, brush, layout.icon_tile,
+                    blend_color(border_hairline, border_strong, tile_fade));
 
                 const std::wstring state = status_text(medication, now);
                 if (!state.empty()) {
@@ -1158,10 +1308,6 @@ void render_redesigned_widget(
                     d2d_render_target, brush, layout.taken_button,
                     button_visual_state(GetDlgItem(
                         window, first_taken_button_id + static_cast<int>(index))));
-                draw_action_button_geometry(
-                    d2d_render_target, brush, layout.edit_button,
-                    button_visual_state(GetDlgItem(
-                        window, first_edit_button_id + static_cast<int>(index))));
             }
         }
         if (!end_d2d(window, brush)) InvalidateRect(window, nullptr, FALSE);
@@ -1195,21 +1341,33 @@ void render_redesigned_widget(
         const bool paused = !medication.enabled;
         const RECT icon_bounds = pixel_rect(layout.icon);
         const int icon_size = pixels(design.icon_size);
+        // The tile crossfades to a pencil on hover: its own content recedes as the glyph arrives.
+        const float fade = fading_icon && *fading_icon == index ? icon_fade : 0.0F;
+        const RECT tile_bounds = pixel_rect(layout.icon_tile.bounds);
         if (index < medication_icons.size() && medication_icons[index]) {
+            const auto base_alpha = static_cast<float>(paused ? 150 : 255);
             const HDC memory = CreateCompatibleDC(device);
             const HGDIOBJ previous = SelectObject(memory, medication_icons[index]);
-            const BLENDFUNCTION blend{AC_SRC_OVER, 0, static_cast<BYTE>(paused ? 150 : 255), AC_SRC_ALPHA};
+            const BLENDFUNCTION blend{
+                AC_SRC_OVER, 0, static_cast<BYTE>(base_alpha * (1.0F - fade)), AC_SRC_ALPHA};
             AlphaBlend(
                 device, icon_bounds.left, icon_bounds.top, icon_size, icon_size, memory, 0, 0, icon_size, icon_size,
                 blend);
             SelectObject(memory, previous);
             DeleteDC(memory);
         } else if (!medication.name.empty()) {
-            SetTextColor(device, paused ? text_secondary : text_primary);
+            SetTextColor(
+                device, blend_color(paused ? text_secondary : text_primary, surface_raised, fade));
             SelectObject(device, initial_font);
             const wchar_t initial[]{medication.name.front(), L'\0'};
-            RECT initial_bounds = pixel_rect(layout.icon_tile.bounds);
+            RECT initial_bounds = tile_bounds;
             DrawText(device, initial, 1, &initial_bounds, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        }
+        if (fade > 0.0F) {
+            SetTextColor(device, blend_color(surface_raised, text_primary, fade));
+            SelectObject(device, glyph_font);
+            RECT pencil_bounds = tile_bounds;
+            DrawText(device, L"\xE70F", 1, &pencil_bounds, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         }
 
         const std::wstring state = status_text(medication, now);
@@ -1272,9 +1430,6 @@ void render_redesigned_widget(
         SelectObject(device, glyph_font);
         RECT taken_bounds = pixel_rect(layout.taken_button.bounds);
         DrawText(device, L"\xE73E", 1, &taken_bounds, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-        SetTextColor(device, text_primary);
-        RECT edit_bounds = pixel_rect(layout.edit_button.bounds);
-        DrawText(device, L"\xE70F", 1, &edit_bounds, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
     }
 
     if (layered_bits) {
@@ -1362,22 +1517,16 @@ LRESULT CALLBACK window_procedure(const HWND window, const UINT message, const W
         return 0;
     case WM_COMMAND: {
         const int taken_index = LOWORD(w_param) - first_taken_button_id;
-        const int edit_index = LOWORD(w_param) - first_edit_button_id;
         if (HIWORD(w_param) == BN_CLICKED && taken_index >= 0 &&
             static_cast<std::size_t>(taken_index) < medications.size()) {
             mark_medication_taken(window, static_cast<std::size_t>(taken_index));
-            return 0;
-        }
-        if (HIWORD(w_param) == BN_CLICKED && edit_index >= 0 &&
-            static_cast<std::size_t>(edit_index) < medications.size()) {
-            edit_medication_at(window, static_cast<std::size_t>(edit_index));
             return 0;
         }
         break;
     }
     case WM_DRAWITEM:
         if (w_param >= first_taken_button_id &&
-            w_param < first_edit_button_id + static_cast<WPARAM>(medications.size())) {
+            w_param < first_taken_button_id + static_cast<WPARAM>(medications.size())) {
             draw_action_button(*reinterpret_cast<const DRAWITEMSTRUCT*>(l_param));
             return TRUE;
         }
@@ -1501,17 +1650,36 @@ LRESULT CALLBACK window_procedure(const HWND window, const UINT message, const W
         }
         return 0;
     }
-    case WM_LBUTTONDOWN:
+    case WM_SETCURSOR: {
+        // The icon tile is clickable but is painted, not a control, so it needs its own cursor.
+        POINT point{};
+        if (LOWORD(l_param) == HTCLIENT && GetCursorPos(&point)) {
+            ScreenToClient(window, &point);
+            if (icon_tile_at(point)) {
+                SetCursor(LoadCursor(nullptr, IDC_HAND));
+                return TRUE;
+            }
+        }
+        break;
+    }
+    case WM_LBUTTONDOWN: {
+        const POINT client_point{
+            static_cast<LONG>(static_cast<short>(LOWORD(l_param))),
+            static_cast<LONG>(static_cast<short>(HIWORD(l_param))),
+        };
+        // The icon tile is the edit affordance, so it takes the click ahead of window dragging.
+        if (const auto icon_index = icon_tile_at(client_point)) {
+            edit_medication_at(window, *icon_index);
+            return 0;
+        }
         if (!widget_settings.position_locked) {
-            POINT point{
-                static_cast<LONG>(static_cast<short>(LOWORD(l_param))),
-                static_cast<LONG>(static_cast<short>(HIWORD(l_param))),
-            };
+            POINT point = client_point;
             ClientToScreen(window, &point);
             ReleaseCapture();
             SendMessage(window, WM_NCLBUTTONDOWN, HTCAPTION, MAKELPARAM(point.x, point.y));
         }
         return 0;
+    }
     case WM_MOUSEMOVE: {
         if (!tracking_mouse_leave) {
             TRACKMOUSEEVENT tracking{sizeof(TRACKMOUSEEVENT), TME_LEAVE, window, 0};
@@ -1528,6 +1696,7 @@ LRESULT CALLBACK window_procedure(const HWND window, const UINT message, const W
             invalidate_progress_bar(window, previous_hover);
             invalidate_progress_bar(window, hovered_bar);
         }
+        set_hovered_icon(window, icon_tile_at(point));
         return 0;
     }
     case WM_MOUSELEAVE:
@@ -1537,6 +1706,7 @@ LRESULT CALLBACK window_procedure(const HWND window, const UINT message, const W
             hovered_bar.reset();
             invalidate_progress_bar(window, previous_hover);
         }
+        set_hovered_icon(window, std::nullopt);
         return 0;
     case WM_KEYDOWN:
         if (w_param == VK_APPS || (w_param == VK_F10 && (GetKeyState(VK_SHIFT) & 0x8000))) {
@@ -1594,6 +1764,14 @@ LRESULT CALLBACK window_procedure(const HWND window, const UINT message, const W
             InvalidateRect(window, nullptr, FALSE);
             return 0;
         }
+        if (w_param == icon_fade_timer) {
+            advance_icon_fade(window);
+            return 0;
+        }
+        if (w_param == focus_fade_timer) {
+            advance_focus_fade(window);
+            return 0;
+        }
         break;
     case WM_PAINT:
         paint_redesigned_widget(window);
@@ -1603,6 +1781,8 @@ LRESULT CALLBACK window_procedure(const HWND window, const UINT message, const W
     case WM_DESTROY:
         KillTimer(window, refresh_timer);
         KillTimer(window, renderer_release_timer);
+        KillTimer(window, icon_fade_timer);
+        KillTimer(window, focus_fade_timer);
         release_renderer();
         remove_tray_icon(window);
         clear_medication_icons();
