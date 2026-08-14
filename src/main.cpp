@@ -43,6 +43,10 @@ struct DesignTokens {
     float icon_radius{9.0F};
     float content_left{72.0F};
     float content_right{310.0F};
+    float name_dose_gap{4.0F};
+    // The progress bar below is a capsule, so its rounded ends make its apparent left edge sit
+    // right of its true bounds. This nudges the text line to look flush with it.
+    float info_left_inset{3.0F};
     float action_area_left{312.0F};
     float action_button_padding{5.0F};
     float action_button_gap{8.0F};
@@ -427,7 +431,7 @@ void rebuild_fonts() {
             -scaled(dip), 0, 0, 0, weight, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
             CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, face);
     };
-    name_font = make_font(14, FW_SEMIBOLD, L"Segoe UI");
+    name_font = make_font(15, FW_SEMIBOLD, L"Segoe UI");
     dose_font = make_font(11, FW_NORMAL, L"Segoe UI");
     status_font = make_font(10, FW_SEMIBOLD, L"Segoe UI");
     countdown_font = make_font(12, FW_SEMIBOLD, L"Segoe UI");
@@ -631,9 +635,8 @@ struct RowLayout {
     RoundedShape card;
     RoundedShape icon_tile;
     D2D1_RECT_F icon;
-    D2D1_RECT_F name_with_state;
-    D2D1_RECT_F name_without_state;
-    D2D1_RECT_F dose;
+    // Name and dose share one line; the dose starts after the measured name width.
+    D2D1_RECT_F info_line;
     RoundedShape badge;
     RoundedShape progress_bar;
     D2D1_RECT_F progress_text;
@@ -664,9 +667,11 @@ RowLayout row_layout(const std::size_t index) {
         .card = rounded_shape(0.0F, top, design.widget_width, top + design.row_height, design.card_radius),
         .icon_tile = rounded_shape(8.0F, top + 8.0F, 64.0F, top + 72.0F, design.icon_radius),
         .icon = rect(12.0F, top + 16.0F, 60.0F, top + 64.0F),
-        .name_with_state = rect(design.content_left, top + 7.0F, 248.0F, top + 27.0F),
-        .name_without_state = rect(design.content_left, top + 7.0F, 306.0F, top + 27.0F),
-        .dose = rect(design.content_left, top + 27.0F, design.content_right, top + 43.0F),
+        // Tall enough for the larger name font, and lifted off the progress bar below it. Name and
+        // dose share the band so they stay on one optical line.
+        .info_line = rect(
+            design.content_left + design.info_left_inset, top + 21.0F, design.content_right,
+            top + 41.0F),
         .badge = capsule(252.0F, top + 8.0F, design.content_right, top + 28.0F),
         .progress_bar = capsule(design.content_left, top + 45.0F, design.content_right, top + 67.0F),
         .progress_text = rect(80.0F, top + 45.0F, 302.0F, top + 67.0F),
@@ -1181,15 +1186,41 @@ void render_redesigned_widget(
         }
 
         const std::wstring state = status_text(medication, now);
-        RECT name_bounds = pixel_rect(state.empty() ? layout.name_without_state : layout.name_with_state);
+        const RECT info_line = pixel_rect(layout.info_line);
+
         SetTextColor(device, paused ? text_secondary : text_primary);
         SelectObject(device, name_font);
-        DrawText(device, medication.name.c_str(), -1, &name_bounds, DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS);
+        TEXTMETRIC name_metrics{};
+        GetTextMetrics(device, &name_metrics);
+        RECT measured = info_line;
+        DrawText(
+            device, medication.name.c_str(), -1, &measured,
+            DT_LEFT | DT_SINGLELINE | DT_CALCRECT);
+        const LONG name_right = std::min(measured.right, info_line.right);
+        RECT name_bounds = info_line;
+        name_bounds.top =
+            info_line.top + ((info_line.bottom - info_line.top) - name_metrics.tmHeight) / 2;
+        name_bounds.bottom = name_bounds.top + name_metrics.tmHeight;
+        DrawText(
+            device, medication.name.c_str(), -1, &name_bounds,
+            DT_LEFT | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS);
 
-        RECT dose_bounds = pixel_rect(layout.dose);
-        SetTextColor(device, text_secondary);
+        // Both runs share the name's baseline, so glyph bottoms line up exactly despite the
+        // different font sizes. Centring each in the same band cannot do this.
+        const LONG baseline = name_bounds.top + name_metrics.tmAscent;
         SelectObject(device, dose_font);
-        DrawText(device, medication.dose.c_str(), -1, &dose_bounds, DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS);
+        TEXTMETRIC dose_metrics{};
+        GetTextMetrics(device, &dose_metrics);
+        RECT dose_bounds = info_line;
+        dose_bounds.left = name_right + pixels(design.name_dose_gap);
+        dose_bounds.top = baseline - dose_metrics.tmAscent;
+        dose_bounds.bottom = dose_bounds.top + dose_metrics.tmHeight;
+        if (dose_bounds.left < dose_bounds.right) {
+            SetTextColor(device, text_secondary);
+            DrawText(
+                device, medication.dose.c_str(), -1, &dose_bounds,
+                DT_LEFT | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS);
+        }
 
         if (!state.empty()) {
             RECT badge = pixel_rect(layout.badge.bounds);
