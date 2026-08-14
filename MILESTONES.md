@@ -5,6 +5,10 @@ This roadmap covers the remaining path from the current implementation to the pr
 safety boundaries, and non-goals. The order below closes the remaining MVP workflow first, adds each persisted setting
 only when its UI exists, and leaves visual polish until behavior is reliable.
 
+**All five milestones are complete as of 2026-08-13.** This document is retained as the delivery record. Subsequent
+work is the post-MVP UI redesign tracked in [`docs/DESIGN_PLAN.md`](docs/DESIGN_PLAN.md), which supersedes the visual
+decisions described here — most notably the row height, which is now 66 DIP rather than the 80 DIP assumed below.
+
 ## Current baseline
 
 The application already has the native borderless widget, timestamp-derived cooldowns, minute-level event-driven

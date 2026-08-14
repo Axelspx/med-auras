@@ -544,3 +544,34 @@ Adopt scope option 1 from the material decision above — **Solid-only Option B*
 - The dual-path branching in `render_redesigned_widget` and `paint_redesigned_widget`; the layered path is now the only path and `WS_EX_LAYERED` is set once at window creation.
 
 Consequences: the binary outer-edge limitation documented for Mica no longer exists anywhere, because every card is drawn through per-pixel alpha. Saved files containing `background_material` remain loadable; the key is ignored and dropped on the next settings write, and a test covers that.
+
+## Minimal grey palette (2026-08-14)
+
+Status: **implemented**
+
+The redesign's colours were a blue-tinted grey — blue ran 14 to 20 points above red in nearly every value — which read as a themed surface rather than a neutral one. The user supplied a reference specifying a `#18181B` background, `#F4F4F5` primary text, `#A1A1AA` secondary text, and 1px borders at 12% white. Those anchors are the Zinc scale, so the ramp was extended consistently from them rather than invented.
+
+Q6's requirement that state never depends on colour alone is unchanged. `SOON` amber, `DUE` red, and `PAUSED` grey keep their accents and their text labels.
+
+- Surfaces step base (`#18181B`) to raised (`#27272A`) to elevated (`#3F3F46`).
+- Borders are a computed hairline: 12% white composited over the base gives `RGB(52, 52, 56)`.
+- Text steps primary, secondary, muted (`#71717A`).
+- Colours are named constants beside `DesignTokens`, replacing roughly 35 scattered `RGB()` literals. This satisfies the geometry follow-up's requirement to centralize tokens, extended to colour.
+
+The progress bar retains its original cool-toned track and fill at the user's explicit instruction. It is therefore the one element whose palette is deliberately inconsistent with its surroundings.
+
+## Card and row layout revision (2026-08-14)
+
+Status: **implemented**
+
+Iterative visual QA on the implemented cards produced the following changes. Q2's fixed 400 DIP width is unchanged; the 80 DIP row height from Q3 is superseded.
+
+- **Icon tile.** Was a lighter gradient (`#3F3F46` to `#2E2E30`) with a strong border, which read as a different material from every other raised surface. It is now a flat `surface_raised` fill with a hairline border, matching the badge.
+- **Action panel removed.** The rounded container behind the Taken and Edit controls was removed outright, including its `RowLayout` shape and four design tokens. The controls now sit directly on the card. `action_panel_left` was renamed `action_area_left`, since it now only marks where the button cluster begins.
+- **Name and dose share one line.** The dose no longer occupies its own row beneath the name; it follows the name's measured width plus a gap, and is skipped rather than clipped when a long name consumes the line. The two are aligned on a **common baseline computed from `GetTextMetrics`**, not by centring both in one band — centring two different font sizes cannot align their glyph bottoms, and a fixed pixel offset drifts across DPI and would silently break on a font-size change. The name font increased from 14 to 15 DIP, and the baseline alignment absorbed that automatically.
+- **Optical inset.** The text line is nudged 3 DIP right of `content_left`. The name and the progress bar share the same x, but the bar is a capsule whose rounded ends make its apparent edge sit right of its true bounds; matching the geometry exactly looked wrong.
+- **Row height 80 to 66 DIP.** The vertical rhythm is now derived from tokens — `row_padding` 8, `info_height` 22, `info_progress_gap` 4, `progress_height` 22, `row_padding_bottom` 10 — whose sum is `row_height`. Padding above and below is explicit, so the card is evenly spaced by construction. The bottom is 2 DIP deeper so the progress bar does not crowd the card edge.
+- **Icon tile 56x64 to 48x48.** Now a true square spanning the padded height, with its image centred by a computed inset. `content_left` moved 72 to 64, giving text and the progress bar 8 DIP more width.
+- **Badge collision.** Because the name and dose now occupy the badge's band, the narrower text variant (`info_line_with_state`) was restored so a long name cannot draw underneath `SOON` or `DUE`.
+
+Every rect in `row_layout` now derives from named tokens; no standalone coordinate literals remain.

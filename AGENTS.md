@@ -272,10 +272,26 @@ Do not jump into non-MVP features before the core widget works reliably.
 
 ## Current Implementation State
 
-Implemented: native borderless widget, timestamp-derived cooldown rows, safe local JSON persistence, one-click
-**Taken**, multiple medications, add/edit with start date/time and interval units, pause/resume, removal, and current-user
-Windows sign-in startup. Still pending: tray show/hide, widget position restoration, drag/lock/always-on-top behavior,
-icon selection/rendering, and final visual/resource polish.
+The MVP is complete. All five milestones in `MILESTONES.md` passed their acceptance gates on 2026-08-13: the native
+borderless widget, timestamp-derived cooldown rows, safe local JSON persistence, one-click **Taken**, multiple
+medications, add/edit with start date/time and interval units, pause/resume, removal, current-user Windows sign-in
+startup, tray show/hide, widget position restoration, drag/lock/always-on-top, medication icons, and per-monitor DPI
+awareness.
+
+Work since then is the post-MVP UI redesign recorded in `docs/DESIGN_PLAN.md`, which remains the authoritative record
+for visual decisions. Current rendering state:
+
+- One layered top-level window. Each frame is drawn into a premultiplied 32-bit DIB and published with
+  `UpdateLayeredWindow`, so Direct2D owns per-pixel alpha and card corners and row gaps are anti-aliased.
+- Geometry is floating-point DIP, centralized in `DesignTokens` and resolved once per row by `RowLayout`. Drawing,
+  native child placement, hover detection, and hit testing all consume that same layout.
+- Colour is centralized alongside it as a neutral grey ramp with chromatic status accents.
+- Native child `BUTTON` controls are retained for keyboard, focus, tooltips, accessibility, and command routing; their
+  appearance comes from the composed layered frame.
+
+Selectable Solid/Mica/Acrylic background materials were implemented and then removed. Do not reintroduce a DWM
+system backdrop, `SetWindowRgn` silhouette, or second presentation path without reading the withdrawal rationale in
+`docs/DESIGN_PLAN.md` first.
 
 ## Definition of Done for MVP
 

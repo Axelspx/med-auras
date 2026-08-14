@@ -225,6 +225,22 @@ The current build includes:
 
 MedAuras MVP is complete. The automated, resource-usage, restart/sleep, and full manual acceptance gates passed on 2026-08-13.
 
+### Widget appearance
+
+The widget is a single layered window. Every frame is rendered into a premultiplied 32-bit DIB and published with
+`UpdateLayeredWindow`, so Direct2D supplies the authoritative per-pixel alpha and the rounded card corners and the gaps
+between rows are smoothly anti-aliased against the desktop. There is no window region and no DWM backdrop.
+
+Cards use a flat neutral grey ramp with hairline borders at roughly 12% white. Text steps primary, secondary, muted;
+`SOON`, `DUE`, and `PAUSED` keep chromatic accents so state is never signalled by grey alone. Each row is 66 DIP tall
+and its vertical rhythm — padding, the name/dose line, a gap, the progress bar, deeper bottom padding — is derived from
+named tokens in `DesignTokens` rather than inline coordinates. The medication name and its dose share one line and are
+aligned on a common baseline computed from font metrics, so they stay aligned across DPI and font-size changes.
+
+Selectable Solid/Mica/Acrylic background materials were implemented and then withdrawn; see
+[`docs/DESIGN_PLAN.md`](docs/DESIGN_PLAN.md). Saved files that still contain `background_material` load normally — the
+key is ignored and dropped on the next settings write.
+
 ### Build and run in CLion
 
 Open this repository as a CMake project, reload CMake, select the `med-auras` CMake target, and run it. Both MSVC and
