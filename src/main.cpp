@@ -66,8 +66,6 @@ constexpr COLORREF surface_raised = RGB(39, 39, 42);
 constexpr COLORREF surface_raised_paused = RGB(36, 36, 39);
 constexpr COLORREF surface_elevated = RGB(63, 63, 70);
 constexpr COLORREF surface_elevated_low = RGB(44, 44, 48);
-constexpr COLORREF surface_elevated_paused = RGB(56, 56, 60);
-constexpr COLORREF surface_elevated_low_paused = RGB(44, 44, 47);
 constexpr COLORREF surface_sunken = RGB(31, 31, 34);
 constexpr COLORREF border_hairline = RGB(52, 52, 56);
 constexpr COLORREF border_strong = RGB(82, 82, 91);
@@ -1098,11 +1096,10 @@ void render_redesigned_widget(
                     paused ? surface_raised_paused : surface_raised,
                     paused ? surface_base_paused : surface_base);
                 stroke_shape(d2d_render_target, brush, layout.card, border_hairline);
-                fill_gradient(
-                    d2d_render_target, layout.icon_tile,
-                    paused ? surface_elevated_paused : surface_elevated,
-                    paused ? surface_elevated_low_paused : surface_elevated_low);
-                stroke_shape(d2d_render_target, brush, layout.icon_tile, border_strong);
+                fill_shape(
+                    d2d_render_target, brush, layout.icon_tile,
+                    paused ? surface_raised_paused : surface_raised);
+                stroke_shape(d2d_render_target, brush, layout.icon_tile, border_hairline);
 
                 const std::wstring state = status_text(medication, now);
                 if (!state.empty()) {
