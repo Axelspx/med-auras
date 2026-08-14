@@ -35,14 +35,27 @@ constexpr int first_edit_button_id = 200;
 struct DesignTokens {
     float widget_width{400.0F};
     float empty_height{60.0F};
-    float row_height{80.0F};
+    // Vertical rhythm: padding, the name/dose line, a gap, the progress bar, then bottom padding.
+    // row_height is the sum of those, so changing any one keeps the card evenly spaced. The bottom
+    // is slightly deeper than the top so the progress bar does not read as crowding the card edge.
+    float row_padding{8.0F};
+    float info_height{22.0F};
+    float info_progress_gap{4.0F};
+    float progress_height{22.0F};
+    float row_padding_bottom{10.0F};
+    float row_height{66.0F};
     float row_gap{4.0F};
     float card_radius{14.0F};
     float stroke{1.0F};
-    float icon_size{48.0F};
+    // The icon tile is square and spans the padded height, so the row height sets its size.
+    float icon_tile_size{48.0F};
+    float icon_size{40.0F};
     float icon_radius{9.0F};
-    float content_left{72.0F};
+    float content_left{64.0F};
     float content_right{310.0F};
+    float badge_left{252.0F};
+    float badge_gap{8.0F};
+    float progress_text_inset{8.0F};
     float name_dose_gap{4.0F};
     // The progress bar below is a capsule, so its rounded ends make its apparent left edge sit
     // right of its true bounds. This nudges the text line to look flush with it.
@@ -635,8 +648,10 @@ struct RowLayout {
     RoundedShape card;
     RoundedShape icon_tile;
     D2D1_RECT_F icon;
-    // Name and dose share one line; the dose starts after the measured name width.
+    // Name and dose share one line; the dose starts after the measured name width. The narrower
+    // variant keeps that line clear of the status badge, which sits on the same band.
     D2D1_RECT_F info_line;
+    D2D1_RECT_F info_line_with_state;
     RoundedShape badge;
     RoundedShape progress_bar;
     D2D1_RECT_F progress_text;
@@ -663,18 +678,30 @@ RowLayout row_layout(const std::size_t index) {
     const float taken_top = top + (design.row_height - design.taken_button_size) * 0.5F;
     const float edit_left = taken_left + design.taken_button_size + design.action_button_gap;
     const float edit_top = top + (design.row_height - design.edit_button_size) * 0.5F;
+    const float info_top = top + design.row_padding;
+    const float info_bottom = info_top + design.info_height;
+    const float progress_top = info_bottom + design.info_progress_gap;
+    const float progress_bottom = progress_top + design.progress_height;
+    const float text_left = design.content_left + design.info_left_inset;
+    const float icon_inset = (design.icon_tile_size - design.icon_size) * 0.5F;
     return RowLayout{
         .card = rounded_shape(0.0F, top, design.widget_width, top + design.row_height, design.card_radius),
-        .icon_tile = rounded_shape(8.0F, top + 8.0F, 64.0F, top + 72.0F, design.icon_radius),
-        .icon = rect(12.0F, top + 16.0F, 60.0F, top + 64.0F),
-        // Tall enough for the larger name font, and lifted off the progress bar below it. Name and
-        // dose share the band so they stay on one optical line.
-        .info_line = rect(
-            design.content_left + design.info_left_inset, top + 21.0F, design.content_right,
-            top + 41.0F),
-        .badge = capsule(252.0F, top + 8.0F, design.content_right, top + 28.0F),
-        .progress_bar = capsule(design.content_left, top + 45.0F, design.content_right, top + 67.0F),
-        .progress_text = rect(80.0F, top + 45.0F, 302.0F, top + 67.0F),
+        .icon_tile = rounded_shape(
+            design.row_padding, top + design.row_padding, design.row_padding + design.icon_tile_size,
+            top + design.row_padding + design.icon_tile_size, design.icon_radius),
+        .icon = rect(
+            design.row_padding + icon_inset, top + design.row_padding + icon_inset,
+            design.row_padding + icon_inset + design.icon_size,
+            top + design.row_padding + icon_inset + design.icon_size),
+        // Name and dose share this band so they stay on one optical line.
+        .info_line = rect(text_left, info_top, design.content_right, info_bottom),
+        .info_line_with_state = rect(
+            text_left, info_top, design.badge_left - design.badge_gap, info_bottom),
+        .badge = capsule(design.badge_left, info_top, design.content_right, info_bottom),
+        .progress_bar = capsule(design.content_left, progress_top, design.content_right, progress_bottom),
+        .progress_text = rect(
+            design.content_left + design.progress_text_inset, progress_top,
+            design.content_right - design.progress_text_inset, progress_bottom),
         .taken_button = capsule(
             taken_left, taken_top, taken_left + design.taken_button_size,
             taken_top + design.taken_button_size),
@@ -1186,7 +1213,8 @@ void render_redesigned_widget(
         }
 
         const std::wstring state = status_text(medication, now);
-        const RECT info_line = pixel_rect(layout.info_line);
+        const RECT info_line =
+            pixel_rect(state.empty() ? layout.info_line : layout.info_line_with_state);
 
         SetTextColor(device, paused ? text_secondary : text_primary);
         SelectObject(device, name_font);
