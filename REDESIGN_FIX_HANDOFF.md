@@ -1,5 +1,10 @@
 # MedAuras redesign/fix handoff
 
+> **Superseded on 2026-08-14.** The background material feature described below was evaluated live and
+> removed. The widget is now Solid-only with a single layered presentation path. See
+> "Background material withdrawn" at the end of `docs/DESIGN_PLAN.md`. Ignore every Mica/dual-presentation
+> statement in this file; the Option A/B geometry and hover-flash work it describes is still current.
+
 ## Purpose
 
 Continue the native C++ MedAuras UI geometry work from the exact state after Option A, Option B, and the layered-window cold-launch fix. Work directly in this checkout. Do not create a new task or discard/revert any existing changes.

@@ -7,7 +7,6 @@
 #include <commdlg.h>
 #include <d2d1.h>
 #include <d2d1helper.h>
-#include <dwmapi.h>
 #include <shellapi.h>
 #include <shlobj.h>
 #include <wincodec.h>
@@ -63,8 +62,6 @@ constexpr UINT edit_medication_command = 3;
 constexpr UINT add_medication_command = 4;
 constexpr UINT lock_position_command = 5;
 constexpr UINT always_on_top_command = 6;
-constexpr UINT solid_material_command = 7;
-constexpr UINT mica_material_command = 8;
 constexpr UINT tray_show_hide_command = 10;
 constexpr UINT tray_startup_command = 11;
 constexpr UINT tray_exit_command = 12;
@@ -92,7 +89,6 @@ UINT taskbar_created_message{};
 HWND tooltip_window{};
 std::optional<std::size_t> hovered_bar;
 bool tracking_mouse_leave{};
-bool mica_active{};
 
 float dpi_scale() {
     return static_cast<float>(widget_dpi) / 96.0F;
@@ -708,63 +704,6 @@ void invalidate_progress_bar(const HWND window, const std::optional<std::size_t>
     InvalidateRect(window, &bounds, FALSE);
 }
 
-void apply_widget_region(const HWND window) {
-    if (widget_settings.background_material == BackgroundMaterial::solid) {
-        SetWindowRgn(window, nullptr, TRUE);
-        return;
-    }
-    HRGN combined = CreateRectRgn(0, 0, 0, 0);
-    if (!combined) return;
-    const int diameter = pixels(design.card_radius * 2.0F);
-    if (medications.empty()) {
-        const RECT bounds = pixel_rect(empty_card_layout().bounds);
-        const HRGN card = CreateRoundRectRgn(
-            bounds.left, bounds.top, bounds.right + 1, bounds.bottom + 1, diameter, diameter);
-        if (card) {
-            CombineRgn(combined, card, nullptr, RGN_COPY);
-            DeleteObject(card);
-        }
-    } else {
-        for (std::size_t index = 0; index < medications.size(); ++index) {
-            const RECT bounds = pixel_rect(row_layout(index).card.bounds);
-            const HRGN card = CreateRoundRectRgn(
-                bounds.left, bounds.top, bounds.right + 1, bounds.bottom + 1, diameter, diameter);
-            if (!card) continue;
-            CombineRgn(combined, combined, card, RGN_OR);
-            DeleteObject(card);
-        }
-    }
-    if (!SetWindowRgn(window, combined, TRUE)) DeleteObject(combined);
-}
-
-void apply_background_material(const HWND window) {
-    constexpr DWORD backdrop_attribute = 38;
-    constexpr int no_backdrop = 1;
-    constexpr int main_window_backdrop = 2;
-    const BOOL dark = TRUE;
-    LONG_PTR extended_style = GetWindowLongPtr(window, GWL_EXSTYLE);
-    const LONG_PTR desired_style = widget_settings.background_material == BackgroundMaterial::solid
-                                       ? extended_style | WS_EX_LAYERED
-                                       : extended_style & ~static_cast<LONG_PTR>(WS_EX_LAYERED);
-    if (desired_style != extended_style) {
-        SetWindowLongPtr(window, GWL_EXSTYLE, desired_style);
-        SetWindowPos(
-            window, nullptr, 0, 0, 0, 0,
-            SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
-    }
-    DwmSetWindowAttribute(window, DWMWA_USE_IMMERSIVE_DARK_MODE, &dark, sizeof(dark));
-    const int backdrop = widget_settings.background_material == BackgroundMaterial::mica
-                             ? main_window_backdrop
-                             : no_backdrop;
-    const HRESULT result = DwmSetWindowAttribute(
-        window, static_cast<DWMWINDOWATTRIBUTE>(backdrop_attribute), &backdrop, sizeof(backdrop));
-    mica_active = widget_settings.background_material == BackgroundMaterial::mica && SUCCEEDED(result);
-    const MARGINS margins = mica_active ? MARGINS{-1, -1, -1, -1} : MARGINS{};
-    DwmExtendFrameIntoClientArea(window, &margins);
-    apply_widget_region(window);
-    InvalidateRect(window, nullptr, TRUE);
-}
-
 std::optional<std::size_t> medication_at(const HWND window, POINT point) {
     if (point.x == -1 && point.y == -1) {
         const int focused_id = GetDlgCtrlID(GetFocus());
@@ -868,8 +807,7 @@ bool rebuild_widget(const HWND window) {
     if (!create_action_buttons(window)) return false;
     SetWindowPos(
         window, nullptr, 0, 0, widget_width(), widget_height(), SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
-    apply_widget_region(window);
-    apply_background_material(window);
+    InvalidateRect(window, nullptr, TRUE);
     RECT bounds{};
     if (GetWindowRect(window, &bounds)) {
         const POINT clamped = clamped_widget_position({bounds.left, bounds.top});
@@ -1113,16 +1051,14 @@ ButtonVisualState button_visual_state(const HWND button) {
 
 void render_redesigned_widget(
     const HWND window, const HDC device, RECT client,
-    const bool layered, BYTE* const layered_bits, const int surface_width, const int surface_height) {
+    BYTE* const layered_bits, const int surface_width, const int surface_height) {
     const auto now = std::chrono::system_clock::now();
     ID2D1SolidColorBrush* brush{};
-    if (begin_d2d(
-            device, client, &brush,
-            layered ? D2D1_ALPHA_MODE_PREMULTIPLIED : D2D1_ALPHA_MODE_IGNORE)) {
-        if (layered) d2d_render_target->Clear(D2D1::ColorF(0.0F, 0.0F, 0.0F, 0.0F));
+    if (begin_d2d(device, client, &brush, D2D1_ALPHA_MODE_PREMULTIPLIED)) {
+        d2d_render_target->Clear(D2D1::ColorF(0.0F, 0.0F, 0.0F, 0.0F));
         if (medications.empty()) {
             const RoundedShape card = empty_card_layout();
-            if (!mica_active) fill_gradient(d2d_render_target, card, RGB(40, 46, 56), RGB(24, 29, 37));
+            fill_gradient(d2d_render_target, card, RGB(40, 46, 56), RGB(24, 29, 37));
             stroke_shape(d2d_render_target, brush, card, RGB(72, 80, 92));
         } else {
             for (std::size_t index = 0; index < medications.size(); ++index) {
@@ -1133,12 +1069,10 @@ void render_redesigned_widget(
                 const bool soon = medication.is_soon_at(now);
                 const bool paused = !medication.enabled;
 
-                if (!mica_active) {
-                    fill_gradient(
-                        d2d_render_target, layout.card,
-                        paused ? RGB(47, 49, 54) : RGB(43, 49, 59),
-                        paused ? RGB(31, 33, 37) : RGB(24, 29, 37));
-                }
+                fill_gradient(
+                    d2d_render_target, layout.card,
+                    paused ? RGB(47, 49, 54) : RGB(43, 49, 59),
+                    paused ? RGB(31, 33, 37) : RGB(24, 29, 37));
                 stroke_shape(d2d_render_target, brush, layout.card, RGB(73, 81, 94));
                 fill_gradient(
                     d2d_render_target, layout.icon_tile,
@@ -1180,16 +1114,14 @@ void render_redesigned_widget(
                     due ? accent : RGB(81, 89, 102));
                 fill_shape(d2d_render_target, brush, layout.action_panel, RGB(34, 39, 48));
                 stroke_shape(d2d_render_target, brush, layout.action_panel, RGB(79, 87, 100));
-                if (layered) {
-                    draw_action_button_geometry(
-                        d2d_render_target, brush, layout.taken_button,
-                        button_visual_state(GetDlgItem(
-                            window, first_taken_button_id + static_cast<int>(index))));
-                    draw_action_button_geometry(
-                        d2d_render_target, brush, layout.edit_button,
-                        button_visual_state(GetDlgItem(
-                            window, first_edit_button_id + static_cast<int>(index))));
-                }
+                draw_action_button_geometry(
+                    d2d_render_target, brush, layout.taken_button,
+                    button_visual_state(GetDlgItem(
+                        window, first_taken_button_id + static_cast<int>(index))));
+                draw_action_button_geometry(
+                    d2d_render_target, brush, layout.edit_button,
+                    button_visual_state(GetDlgItem(
+                        window, first_edit_button_id + static_cast<int>(index))));
             }
         }
         if (!end_d2d(window, brush)) InvalidateRect(window, nullptr, FALSE);
@@ -1270,16 +1202,14 @@ void render_redesigned_widget(
             device, text.c_str(), -1, &bar_text,
             DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
 
-        if (layered) {
-            const HWND taken_button = GetDlgItem(window, first_taken_button_id + static_cast<int>(index));
-            SetTextColor(device, IsWindowEnabled(taken_button) ? RGB(239, 242, 247) : RGB(115, 120, 130));
-            SelectObject(device, glyph_font);
-            RECT taken_bounds = pixel_rect(layout.taken_button.bounds);
-            DrawText(device, L"\xE73E", 1, &taken_bounds, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-            SetTextColor(device, RGB(239, 242, 247));
-            RECT edit_bounds = pixel_rect(layout.edit_button.bounds);
-            DrawText(device, L"\xE70F", 1, &edit_bounds, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-        }
+        const HWND taken_button = GetDlgItem(window, first_taken_button_id + static_cast<int>(index));
+        SetTextColor(device, IsWindowEnabled(taken_button) ? RGB(239, 242, 247) : RGB(115, 120, 130));
+        SelectObject(device, glyph_font);
+        RECT taken_bounds = pixel_rect(layout.taken_button.bounds);
+        DrawText(device, L"\xE73E", 1, &taken_bounds, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        SetTextColor(device, RGB(239, 242, 247));
+        RECT edit_bounds = pixel_rect(layout.edit_button.bounds);
+        DrawText(device, L"\xE70F", 1, &edit_bounds, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
     }
 
     if (layered_bits) {
@@ -1289,14 +1219,11 @@ void render_redesigned_widget(
 
 void paint_redesigned_widget(const HWND window) {
     PAINTSTRUCT paint{};
-    const HDC paint_device = BeginPaint(window, &paint);
+    // The frame is rendered into an offscreen DIB and published with UpdateLayeredWindow, so the
+    // paint device is unused. BeginPaint/EndPaint still has to run to clear the update region.
+    static_cast<void>(BeginPaint(window, &paint));
     RECT client{};
     GetClientRect(window, &client);
-    if (widget_settings.background_material != BackgroundMaterial::solid) {
-        render_redesigned_widget(window, paint_device, client, false, nullptr, 0, 0);
-        EndPaint(window, &paint);
-        return;
-    }
     EndPaint(window, &paint);
 
     const int width = client.right - client.left;
@@ -1324,8 +1251,7 @@ void paint_redesigned_widget(const HWND window) {
 
     const HGDIOBJ previous = SelectObject(memory, bitmap);
     std::memset(bits, 0, static_cast<std::size_t>(width) * static_cast<std::size_t>(height) * 4);
-    render_redesigned_widget(
-        window, memory, client, true, static_cast<BYTE*>(bits), width, height);
+    render_redesigned_widget(window, memory, client, static_cast<BYTE*>(bits), width, height);
 
     RECT window_bounds{};
     GetWindowRect(window, &window_bounds);
@@ -1355,8 +1281,6 @@ LRESULT CALLBACK window_procedure(const HWND window, const UINT message, const W
     switch (message) {
     case WM_CREATE:
         if (!create_action_buttons(window)) return -1;
-        apply_widget_region(window);
-        apply_background_material(window);
         if (!add_tray_icon(window)) {
             MessageBox(
                 window, L"The system tray icon could not be created.", L"Medication Cooldown Widget",
@@ -1422,18 +1346,6 @@ LRESULT CALLBACK window_procedure(const HWND window, const UINT message, const W
         AppendMenu(
             menu, MF_STRING | (widget_settings.always_on_top ? MF_CHECKED : MF_UNCHECKED),
             always_on_top_command, L"Always on top");
-        const HMENU material_menu = CreatePopupMenu();
-        if (material_menu) {
-            AppendMenu(
-                material_menu,
-                MF_STRING | (widget_settings.background_material == BackgroundMaterial::solid ? MF_CHECKED : 0),
-                solid_material_command, L"Solid");
-            AppendMenu(
-                material_menu,
-                MF_STRING | (widget_settings.background_material == BackgroundMaterial::mica ? MF_CHECKED : 0),
-                mica_material_command, L"Mica");
-            AppendMenu(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(material_menu), L"Background material");
-        }
         SetForegroundWindow(window);
         const UINT command = TrackPopupMenu(
             menu, TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON, point.x, point.y, 0, window, nullptr);
@@ -1521,23 +1433,6 @@ LRESULT CALLBACK window_procedure(const HWND window, const UINT message, const W
                     window, L"The always-on-top setting could not be saved.", L"Medication Cooldown Widget",
                     MB_OK | MB_ICONERROR);
             }
-        } else if (command == solid_material_command || command == mica_material_command) {
-            const BackgroundMaterial selected =
-                command == mica_material_command ? BackgroundMaterial::mica : BackgroundMaterial::solid;
-            if (selected != widget_settings.background_material) {
-                const BackgroundMaterial previous = widget_settings.background_material;
-                widget_settings.background_material = selected;
-                apply_background_material(window);
-                try {
-                    save_state();
-                } catch (const std::exception&) {
-                    widget_settings.background_material = previous;
-                    apply_background_material(window);
-                    MessageBox(
-                        window, L"The background material setting could not be saved.",
-                        L"Medication Cooldown Widget", MB_OK | MB_ICONERROR);
-                }
-            }
         }
         return 0;
     }
@@ -1618,8 +1513,6 @@ LRESULT CALLBACK window_procedure(const HWND window, const UINT message, const W
         SetWindowPos(
             window, nullptr, position.x, position.y, widget_width(), widget_height(),
             SWP_NOZORDER | SWP_NOACTIVATE);
-        apply_widget_region(window);
-        apply_background_material(window);
         persist_window_position(window, false);
         schedule_refresh(window);
         InvalidateRect(window, nullptr, FALSE);
@@ -1723,7 +1616,9 @@ int WINAPI wWinMain(const HINSTANCE instance, HINSTANCE, PWSTR, const int show_c
                                        ? clamped_widget_position({*widget_settings.window_x, *widget_settings.window_y})
                                        : POINT{CW_USEDEFAULT, CW_USEDEFAULT};
     const HWND window = CreateWindowEx(
-        WS_EX_TOOLWINDOW | WS_EX_CONTROLPARENT | (widget_settings.always_on_top ? WS_EX_TOPMOST : 0), window_class,
+        WS_EX_TOOLWINDOW | WS_EX_CONTROLPARENT | WS_EX_LAYERED |
+            (widget_settings.always_on_top ? WS_EX_TOPMOST : 0),
+        window_class,
         L"Medication Cooldown Widget", WS_POPUP | WS_CLIPCHILDREN, initial_position.x, initial_position.y, widget_width(),
         widget_height(), nullptr, nullptr, instance, nullptr);
     if (!window) return 1;

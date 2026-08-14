@@ -7,17 +7,11 @@
 #include <span>
 #include <vector>
 
-enum class BackgroundMaterial {
-    solid,
-    mica,
-};
-
 struct WidgetSettings {
     std::optional<int> window_x;
     std::optional<int> window_y;
     bool position_locked{};
     bool always_on_top{};
-    BackgroundMaterial background_material{BackgroundMaterial::solid};
 };
 
 [[nodiscard]] std::vector<Medication> load_medications(

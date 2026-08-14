@@ -10,7 +10,7 @@ add_executable(med-auras WIN32
 )
 target_compile_features(med-auras PRIVATE cxx_std_20)
 target_compile_definitions(med-auras PRIVATE UNICODE _UNICODE NOMINMAX)
-target_link_libraries(med-auras PRIVATE Advapi32 Comctl32 Shell32 Ole32 Comdlg32 Windowscodecs Msimg32 Dwmapi D2d1)
+target_link_libraries(med-auras PRIVATE Advapi32 Comctl32 Shell32 Ole32 Comdlg32 Windowscodecs Msimg32 D2d1)
 
 if(MSVC)
     target_compile_options(med-auras PRIVATE /W4 /permissive-)

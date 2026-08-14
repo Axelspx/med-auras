@@ -518,3 +518,29 @@ Verification results:
 - A settled 30-second visible-idle sample recorded 0 CPU seconds, approximately 8.34 MB private memory after the multi-DPI QA sequence, 16 threads, and stable handles (219 to 219).
 
 Mica remains intentionally on the Option A region/backdrop presentation path and still needs a live material check. Perfect per-pixel desktop-facing Mica corners remain outside this bounded implementation for the architectural reason documented above.
+
+## Background material withdrawn (2026-08-14)
+
+Status: **implemented; Q11 and Q15 are withdrawn and the widget is Solid-only**
+
+The deferred live Mica check was finally run and the material feature was withdrawn as a result. Q11 ("Solid and Mica only") and Q15 (persisted material submenu) no longer describe the product. Every statement about selectable materials earlier in this document is superseded by this section.
+
+### What the live check found
+
+1. **Mica never rendered as designed.** The non-layered path skipped the card fill so the backdrop could show through, but skipping is not the same as painting. The card interiors kept whatever pixels the redirection surface already held, so after switching from Solid they showed the previous opaque Solid frame. A fresh launch happened to start from a cleared surface, which is why Mica appeared to work once and then "broke" after toggling. The user's original report of toggle-dependent breakage was correct.
+2. **The correct erase must come from GDI, not Direct2D.** A DWM backdrop is only visible through pixels left at zero alpha. GDI does not write the alpha byte, so a black `FillRect` clears stale content without making it opaque. An equivalent Direct2D clear under `D2D1_ALPHA_MODE_IGNORE` writes alpha 255 and blocks the backdrop completely. This was confirmed by trying the Direct2D version first and observing a fully opaque widget.
+3. **Mica was judged too subtle once it did work.** Mica is specified as an opaque wallpaper-tinted material, not a transparency, so this is inherent rather than a defect.
+4. **Acrylic was implemented, then rejected on cost.** `DWMSBT_TRANSIENTWINDOW` looked correct, but dragging the widget became visibly laggy. Sampling during interaction showed `dwm.exe` averaging above one full core while the application itself stayed near 7–11%, so the cost is compositor-side and not addressable from the paint path. Acrylic is also documented as a transient-window material, which suits menus and flyouts rather than a persistent widget that is repositioned by hand.
+
+### Decision
+
+Adopt scope option 1 from the material decision above — **Solid-only Option B** — and delete the material feature rather than keep a second presentation path. Dual presentation existed to preserve a choice that has now been evaluated and declined, and it was the source of every defect in this section.
+
+### What was removed
+
+- `BackgroundMaterial`, the `background_material` setting, its JSON read/write, and the right-click submenu.
+- `apply_background_material`, `apply_widget_region`, and the whole `HRGN` silhouette path.
+- All `dwmapi` usage, including `DWMWA_SYSTEMBACKDROP_TYPE`, `DwmExtendFrameIntoClientArea`, and the `Dwmapi` link dependency.
+- The dual-path branching in `render_redesigned_widget` and `paint_redesigned_widget`; the layered path is now the only path and `WS_EX_LAYERED` is set once at window creation.
+
+Consequences: the binary outer-edge limitation documented for Mica no longer exists anywhere, because every card is drawn through per-pixel alpha. Saved files containing `background_material` remain loadable; the key is ignored and dropped on the next settings write, and a test covers that.
