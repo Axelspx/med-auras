@@ -53,10 +53,16 @@ Update the visible countdown only as often as its format actually requires, and 
 it.
 
 The countdown currently shows seconds, which the user requested explicitly, so it ticks once per second while
-a countdown is on screen. That costs roughly 0.7% of one core. It is the exception, not licence for
+a countdown is on screen. That costs roughly 0.5% of one core. It is the exception, not licence for
 high-frequency work generally: a coarser format must go back to a coarser tick. No timer is scheduled at all
 when the widget is hidden or when every medication is ready or paused, and the per-second repaint is skipped
 while a fullscreen or presentation-mode app is in front, which returns the process to zero.
+
+This constraint is about *recurring work*, and that part still holds exactly. The footprint no longer does:
+the live backdrop blur hosts a Direct3D 11 device and the composition runtime, which costs roughly 59 MB and
+about 69 threads against the 7 MB and single thread this section was written for. That was an explicit user
+request, measured and recorded in `docs/DESIGN_PLAN.md`. Do not treat it as permission to relax the rules
+above — no polling, no busy loop, and no timer that a visible countdown does not require.
 
 Timer state must survive application restart, Windows restart, sleep, and hibernation.
 
@@ -250,6 +256,12 @@ When modifying code:
 7. Keep warnings clean where practical.
 8. Do not silently expand scope.
 
+Building, as of 2026-08-16: CMake configure fails for MSVC 19.50 (`target_compile_features no known features`), so
+MinGW is the only toolchain that configures and MSVC must be checked by invoking `cl` directly. The fix is known and
+recorded in the README but has not been applied. The executable at `build\Release\med-auras.exe` is the one Windows
+startup launches; when built with MinGW it needs `-static-libgcc -static-libstdc++` and the `libwinpthread-1.dll`
+kept beside it, or it will not start outside CLion.
+
 ## Response Style
 
 After completing code work, explain:
@@ -336,5 +348,6 @@ The MVP is complete when the user can:
 10. leave the app idle with effectively no measurable CPU activity
 
 Item 10 now means: zero while hidden, zero while every medication is ready or paused, and zero while a
-fullscreen app is in front. A visible, running countdown costs about 0.7% of one core because it displays
-seconds at the user's request.
+fullscreen app is in front. A visible, running countdown costs about 0.5% of one core because it displays
+seconds at the user's request. It is a statement about CPU only — memory and thread count are no longer
+small, for the reason given under Primary Constraint.

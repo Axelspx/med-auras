@@ -17,6 +17,14 @@ Two of Milestone 4's acceptance criteria have since been knowingly traded away a
 - **"keyboard-only add/edit/take/pause flows work."** Edit lost its Tab stop when the pencil control was replaced by
   the icon tile. It is still reachable via Shift+F10 → **Edit...**, but no longer by Tab.
 
+The final acceptance list below has since been overtaken in two further places by the 2026-08-16 live backdrop blur:
+
+- **"no ... worker thread"** and the small-footprint expectation behind the idle measurement. Hosting a Direct3D 11
+  device and the composition runtime takes the process to roughly 59 MB and about 69 threads, from 7 MB and one.
+  Idle CPU still holds, and in fact improved slightly. The design plan records the measurements and the trade.
+- **"Both supported toolchains produce working Release executables."** MSVC still compiles cleanly, but CMake
+  configure fails for MSVC 19.50; only MinGW currently configures. See the README toolchain note.
+
 ## Current baseline
 
 The application already has the native borderless widget, timestamp-derived cooldowns, minute-level event-driven

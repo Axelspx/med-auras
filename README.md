@@ -258,14 +258,42 @@ key is ignored and dropped on the next settings write.
 
 ### Build and run in CLion
 
-Open this repository as a CMake project, reload CMake, select the `med-auras` CMake target, and run it. Both MSVC and
-CLion's bundled MinGW toolchain are supported. The automated executable is the separate `medication-test` target.
+Open this repository as a CMake project, reload CMake, select the `med-auras` CMake target, and run it. The automated
+executable is the separate `medication-test` target.
 
 Medication data is stored at:
 
 ```text
 %LOCALAPPDATA%\MedAuras\medications.json
 ```
+
+#### Toolchain state
+
+The source compiles cleanly under both MSVC (`/W4 /permissive-`) and CLion's bundled MinGW, but **CMake configure
+currently fails for MSVC 19.50 / Visual Studio 18**:
+
+```text
+target_compile_features no known features for CXX compiler "MSVC"
+```
+
+This is a CMake/compiler-version mismatch in `CMakeLists.txt`, not a source problem, and it predates the blur work.
+Replacing the two `target_compile_features(... cxx_std_20)` calls with
+`set_property(TARGET ... PROPERTY CXX_STANDARD 20)` is the known fix; it has not been applied. Until it is, MSVC can
+only be verified by invoking `cl` directly, and MinGW is the only toolchain that configures.
+
+#### Standalone executable
+
+The binary registered for Windows startup lives at `build\Release\med-auras.exe`. When built with MinGW it must be
+linked so it does not depend on DLLs that only exist inside CLion, or it will fail to launch from Explorer or at
+sign-in, where CLion is not on `PATH`:
+
+```text
+-DCMAKE_EXE_LINKER_FLAGS="-static-libgcc -static-libstdc++ -Wl,-s"
+```
+
+That removes `libstdc++-6.dll` and `libgcc_s_seh-1.dll`. A full `-static` link is not possible with CLion's bundled
+MinGW — its static `libmsvcrt`/`libwinpthread` fail with `undefined reference to __intrinsic_setjmpex` — so
+`libwinpthread-1.dll` remains a dependency and is kept beside the executable. **Keep those two files together.**
 
 ### Release verification
 
@@ -284,10 +312,18 @@ Before release, manually verify this daily-use path on Windows 11:
    position restoration, monitor removal, always-on-top, and keyboard operation including Shift+F10 → **Edit...**.
 3. Confirm active timers remain correct across sleep, hibernation, Windows restart, and wall-clock advancement.
 4. Observe resource use in each state. Hidden, all-ready/paused, and fullscreen-app-in-front should all schedule no
-   repaint and hold CPU at effectively 0%. A visible, running countdown ticks once per second and costs roughly 0.7%
+   repaint and hold CPU at effectively 0%. A visible, running countdown ticks once per second and costs roughly 0.5%
    of one core; confirm it returns to zero when the widget is hidden or covered by a fullscreen app.
 5. Confirm memory, handle, USER, and GDI counts remain stable through repeated use and that the process owns no network
-   endpoints. The per-second repaint makes handle stability worth rechecking specifically.
+   endpoints. The per-second repaint makes handle stability worth rechecking specifically. Memory settles near 59 MB
+   because of the Direct3D/composition device; what matters is that it is stable, not small.
+6. Drag the widget across other windows and over a high-contrast wallpaper and confirm the card interiors track what
+   is behind them, that the gaps between cards stay fully transparent, and that text, icons, and the progress bar
+   stay sharp.
+7. Confirm clicks pass through the row gaps and the rounded outer corners to whatever is beneath, and that the
+   **Taken** button and the icon tile still respond. `WM_NCHITTEST` should answer `HTCLIENT` only inside a card.
+8. Launch `build\Release\med-auras.exe` with CLion off `PATH` to confirm the shipped binary has no toolchain-local
+   DLL dependency.
 
 The 2026-08-13 development verification produced passing MSVC and CLion-MinGW Release builds/CTest runs. A 20-second
 visible-idle sample used 0 CPU seconds, one thread, approximately 2.8 MB private memory, stable GDI/USER counts, and no
@@ -302,6 +338,12 @@ After live backdrop blur was added, a 20-second Release sample with a running co
 0.47% of one core, lower than before, since a composition-surface upload is cheaper than `UpdateLayeredWindow`) with
 handles flat at 531. Hosting a Direct3D 11 device and the composition runtime raised private memory from roughly 7 MB
 to 59 MB and thread count from 1 to about 69. No new timer, poll, or redraw loop was introduced.
+
+The 2026-08-16 blur verification produced clean MinGW Debug and Release builds, a clean MSVC `/W4 /permissive-`
+compile via `cl` (CMake configure for MSVC is broken, see above), CTest 1/1 in both MinGW trees, live blur confirmed
+against a hard-edged colour-stripe window, `WM_NCHITTEST` returning `HTCLIENT` only inside cards, and the composition
+path falling back to `WS_EX_LAYERED` with opaque cards when initialization is forced to fail. Real multi-monitor DPI
+changes and sleep/resume were **not** re-tested against the new presentation path and remain open release checks.
 
 ## Status Styling
 

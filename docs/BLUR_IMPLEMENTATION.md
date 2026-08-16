@@ -1,5 +1,11 @@
 # BLUR_IMPLEMENTATION.md
 
+> **Status: implemented, 2026-08-16.** This document is the original brief and is retained as the specification it
+> was written as. What was actually built, the two deliberate deviations from it, the DWM defect that ownership of a
+> popup window causes, and the measured resource cost are recorded in
+> [`DESIGN_PLAN.md`](DESIGN_PLAN.md#live-backdrop-blur-behind-the-cards-2026-08-16), which is authoritative where the
+> two disagree.
+
 ## Goal
 
 Implement a true live transparent blur behind each medication card.
