@@ -7,7 +7,15 @@ only when its UI exists, and leaves visual polish until behavior is reliable.
 
 **All five milestones are complete as of 2026-08-13.** This document is retained as the delivery record. Subsequent
 work is the post-MVP UI redesign tracked in [`docs/DESIGN_PLAN.md`](docs/DESIGN_PLAN.md), which supersedes the visual
-decisions described here — most notably the row height, which is now 66 DIP rather than the 80 DIP assumed below.
+decisions described here — most notably the card size, now 364 × 66 DIP rather than 400 × 80.
+
+Two of Milestone 4's acceptance criteria have since been knowingly traded away and are no longer accurate:
+
+- **"no animations, seconds-level updates, or new idle wakeups."** The countdown now displays seconds and ticks once
+  per second while visible, and bounded hover and focus transitions exist. Both were explicitly requested; the design
+  plan records the measured cost and the conditions under which the process still reaches zero.
+- **"keyboard-only add/edit/take/pause flows work."** Edit lost its Tab stop when the pencil control was replaced by
+  the icon tile. It is still reachable via Shift+F10 → **Edit...**, but no longer by Tab.
 
 ## Current baseline
 

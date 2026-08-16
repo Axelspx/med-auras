@@ -27,16 +27,14 @@ The visual direction should take inspiration from WoW cooldown trackers: compact
 Example:
 
 ```text
-[icon] Elvanse 40 mg          13h 24m   [Taken]
-       ███████████████░░░░░░░░░░░░░
-       Next dose: tomorrow 10:30
+[icon] Elvanse 40 mg                    [Taken]
+       ██████████████ 13:24:07 ░░░░░░░░
 
-[icon] Ibuprofen 400 mg        2h 11m   [Taken]
-       █████░░░░░░░░░░░░░░░░░░░░░░
-       Last taken: 09:14
+[icon] Ibuprofen 400 mg                 [Taken]
+       █████ 02:11:45 ░░░░░░░░░░░░░░░░░
 
-[icon] Vitamin D                READY   [Taken]
-       █████████████████████████████
+[icon] Vitamin D                        [Taken]
+       ████████████ READY ██████████████
 ```
 
 ## Technology
@@ -231,11 +229,21 @@ The widget is a single layered window. Every frame is rendered into a premultipl
 `UpdateLayeredWindow`, so Direct2D supplies the authoritative per-pixel alpha and the rounded card corners and the gaps
 between rows are smoothly anti-aliased against the desktop. There is no window region and no DWM backdrop.
 
-Cards use a flat neutral grey ramp with hairline borders at roughly 12% white. Text steps primary, secondary, muted;
-`SOON`, `DUE`, and `PAUSED` keep chromatic accents so state is never signalled by grey alone. Each row is 66 DIP tall
-and its vertical rhythm — padding, the name/dose line, a gap, the progress bar, deeper bottom padding — is derived from
-named tokens in `DesignTokens` rather than inline coordinates. The medication name and its dose share one line and are
-aligned on a common baseline computed from font metrics, so they stay aligned across DPI and font-size changes.
+Cards are 364 × 66 DIP and use a flat neutral grey ramp with hairline borders at roughly 12% white. Text steps
+primary, secondary, muted; `SOON`, `DUE`, and `PAUSED` keep chromatic accents so state is never signalled by grey
+alone. The vertical rhythm — padding, the name/dose line, a gap, the progress bar, deeper bottom padding — is derived
+from named tokens in `DesignTokens` rather than inline coordinates. The medication name and its dose share one line
+and are aligned on a common baseline computed from font metrics, so they stay aligned across DPI and font-size
+changes.
+
+Each row has one action control, **Taken**. Editing is reached by clicking the medication's icon tile, which
+crossfades to a pencil glyph on hover; both the tile and the Taken circle show a hand cursor. The countdown reads
+`1:20:00` above an hour and `MM:SS` below it, and is drawn twice against a clip at the progress fill edge so the part
+over the bright fill and the part over the dark track each contrast what is actually beneath them, splitting
+mid-glyph where it crosses.
+
+Editing has no Tab stop of its own, since the icon tile is painted rather than a control. It remains reachable from
+the keyboard through the row context menu (Shift+F10 or the Menu key) → **Edit...**.
 
 Selectable Solid/Mica/Acrylic background materials were implemented and then withdrawn; see
 [`docs/DESIGN_PLAN.md`](docs/DESIGN_PLAN.md). Saved files that still contain `background_material` load normally — the
@@ -265,17 +273,23 @@ Before release, manually verify this daily-use path on Windows 11:
 
 1. Configure medications, click **Taken**, terminate/relaunch, and confirm the saved anchor and derived timer remain
    correct.
-2. Exercise edit, pause/resume, removal, icon fallback, tray hide/show, startup enable/disable, position restoration,
-   monitor removal, always-on-top, and keyboard operation.
+2. Exercise edit via the icon tile, pause/resume, removal, icon fallback, tray hide/show, startup enable/disable,
+   position restoration, monitor removal, always-on-top, and keyboard operation including Shift+F10 → **Edit...**.
 3. Confirm active timers remain correct across sleep, hibernation, Windows restart, and wall-clock advancement.
-4. Observe ready/paused and hidden states at idle: CPU should remain effectively 0%, hidden state should have no refresh
-   timer, and a visible active countdown should update no more than once per minute.
+4. Observe resource use in each state. Hidden, all-ready/paused, and fullscreen-app-in-front should all schedule no
+   repaint and hold CPU at effectively 0%. A visible, running countdown ticks once per second and costs roughly 0.7%
+   of one core; confirm it returns to zero when the widget is hidden or covered by a fullscreen app.
 5. Confirm memory, handle, USER, and GDI counts remain stable through repeated use and that the process owns no network
-   endpoints.
+   endpoints. The per-second repaint makes handle stability worth rechecking specifically.
 
 The 2026-08-13 development verification produced passing MSVC and CLion-MinGW Release builds/CTest runs. A 20-second
 visible-idle sample used 0 CPU seconds, one thread, approximately 2.8 MB private memory, stable GDI/USER counts, and no
 TCP or UDP endpoints.
+
+After the seconds countdown was added, a 20-second sample with a running countdown measured 141 ms of CPU (about 0.7%
+of one core) and a 90-second sample held handles flat at 218 with private memory oscillating between roughly 6.6 and
+7.5 MB. Cursor parked on the icon tile, on the Taken button, and away from the widget each measured 0 ms over 8
+seconds, confirming the hover and focus transitions settle rather than run continuously.
 
 ## Status Styling
 

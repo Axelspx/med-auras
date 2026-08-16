@@ -49,7 +49,14 @@ Required approach:
 - only schedule timer callbacks when useful
 - update visible countdown text no more often than necessary
 
-For normal medication intervals, minute-level display updates are sufficient unless a requirement explicitly needs finer precision.
+Update the visible countdown only as often as its format actually requires, and only when someone can see
+it.
+
+The countdown currently shows seconds, which the user requested explicitly, so it ticks once per second while
+a countdown is on screen. That costs roughly 0.7% of one core. It is the exception, not licence for
+high-frequency work generally: a coarser format must go back to a coarser tick. No timer is scheduled at all
+when the widget is hidden or when every medication is ready or paused, and the per-second repaint is skipped
+while a fullscreen or presentation-mode app is in front, which returns the process to zero.
 
 Timer state must survive application restart, Windows restart, sleep, and hibernation.
 
@@ -187,9 +194,13 @@ Avoid:
 - large settings screens
 - continuous animations
 - decorative effects with ongoing CPU/GPU cost
-- seconds-level countdown animation unless explicitly requested
 
 The widget should look polished but remain cheap to render.
+
+Short, bounded transitions are permitted where the user has asked for one: the icon tile's hover crossfade
+and the focus ring's recede both run on a timer that stops itself when the transition completes. A transition
+that cannot end, or that runs while nothing is being interacted with, is a continuous animation and is still
+out of scope. The seconds countdown is likewise an explicit request rather than a default.
 
 ## Architecture Rules
 
@@ -287,7 +298,13 @@ for visual decisions. Current rendering state:
   native child placement, hover detection, and hit testing all consume that same layout.
 - Colour is centralized alongside it as a neutral grey ramp with chromatic status accents.
 - Native child `BUTTON` controls are retained for keyboard, focus, tooltips, accessibility, and command routing; their
-  appearance comes from the composed layered frame.
+  appearance comes from the composed layered frame. Because a layered window presents only its published bitmap, a
+  control repainting itself is never seen: any hover, pressed, focus, or enablement change must invalidate the
+  parent, and only on a real state transition, or the frame is republished continuously.
+- Cards are 364 x 66 DIP. There is one action control, **Taken**. Editing is reached by clicking the icon tile,
+  which crossfades to a pencil on hover; both it and the Taken circle show a hand cursor.
+- The countdown reads `1:20:00` above an hour and `MM:SS` below it, and its text is drawn twice against a clip at
+  the progress fill edge so each half contrasts the colour actually beneath it.
 
 Selectable Solid/Mica/Acrylic background materials were implemented and then removed. Do not reintroduce a DWM
 system backdrop, `SetWindowRgn` silhouette, or second presentation path without reading the withdrawal rationale in
@@ -307,3 +324,7 @@ The MVP is complete when the user can:
 8. show/hide the widget from the system tray
 9. disable automatic startup if desired
 10. leave the app idle with effectively no measurable CPU activity
+
+Item 10 now means: zero while hidden, zero while every medication is ready or paused, and zero while a
+fullscreen app is in front. A visible, running countdown costs about 0.7% of one core because it displays
+seconds at the user's request.

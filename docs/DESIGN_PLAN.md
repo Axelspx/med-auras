@@ -575,3 +575,48 @@ Iterative visual QA on the implemented cards produced the following changes. Q2'
 - **Badge collision.** Because the name and dose now occupy the badge's band, the narrower text variant (`info_line_with_state`) was restored so a long name cannot draw underneath `SOON` or `DUE`.
 
 Every rect in `row_layout` now derives from named tokens; no standalone coordinate literals remain.
+
+## Edit affordance, motion, and seconds countdown (2026-08-14)
+
+Status: **implemented**
+
+This round reverses parts of Q5, Q9, Q14, and Q16, and the "no animations" acceptance criterion. Each reversal was explicitly requested; they are recorded here so the earlier entries are not read as current.
+
+### Edit moves to the icon tile (supersedes Q5 and Q9)
+
+The pencil control is gone. Q5's "two icon-only circles" is now one: **Taken**. Editing is reached by clicking the medication's icon tile, which crossfades to a pencil glyph on hover. Removing the pencil and its gap freed 36 DIP, so the card narrowed from 400 to **364 DIP**, superseding Q3's fixed 400 DIP width. Text and progress widths are unchanged; only the right margin closed up.
+
+Two costs were accepted rather than solved:
+
+- **The edit action lost its Tab stop**, along with the tooltip and accessible name a real control provided. A painted region cannot carry them. Edit remains keyboard-reachable through the row context menu (Shift+F10 → **Edit...**), so there is still a keyboard path, but it is less discoverable than a focusable control. This is a real regression against Milestone 4's keyboard acceptance criteria.
+- **The tile no longer drags the widget**, since it consumes the click. The rest of the card still does.
+
+### Bounded motion (supersedes Q16 and the "no animations" criterion)
+
+Q16 resolved on static hover, pressed, focus, and disabled feedback, and the acceptance criteria said no animations. Three transitions now exist, all bounded — each runs on a timer that kills itself on arrival, so a settled widget schedules no work:
+
+- the icon tile's hover crossfade, where the tile's own content recedes as the pencil arrives and the tile lights to the same `surface_elevated` the action button uses;
+- the focus ring receding after a **pointer**-driven focus. Keyboard focus keeps a solid ring, because fading it unconditionally would remove the only visible focus indicator and break Milestone 4's "focus is visible". The distinction is drawn by flagging `WM_LBUTTONDOWN` before the control takes focus.
+
+Measured: cursor resting on the tile, on the Taken button, at either boundary, and away from the widget all held 0 ms of CPU over 8 seconds.
+
+### Layered windows do not show child control state
+
+A latent defect surfaced here. The Taken button's hover, pressed, and focus visuals had existed since Option A but were never visible: a layered window presents only the bitmap published by `UpdateLayeredWindow`, so a child control repainting itself never reaches the screen. Two things were required, and the first alone was not enough:
+
+1. the parent must be invalidated when the control's state changes, and
+2. the state must be one the control actually reports. `BST_HOT` never materialised for this control, so hover is tracked directly in the subclass via `WM_MOUSEMOVE`/`WM_MOUSELEAVE`, the same way the progress bar and icon tile already worked.
+
+Invalidating on every mouse move republished the whole frame continuously — measured at 281 ms/8 s while moving and 109 ms/8 s after the pointer had left. Repainting only on a genuine state transition, compared against a value cached in the subclass reference data, returned it to zero.
+
+### Countdown format and refresh cadence (supersedes Q14)
+
+The countdown now reads `1:20:00` above an hour and `MM:SS` below it, replacing `13h 24m`. Hours are unpadded and omitted when zero; below an hour the field is fixed-width.
+
+Showing seconds requires a one-second tick, which supersedes the minute-level refresh assumed throughout this document. Nothing seconds-level is persisted: `remaining_seconds` derives from the same stored anchor, so the timestamp model and restart/sleep correctness are untouched.
+
+Cost, measured: **about 0.7% of one core** while a countdown is visible. It returns to zero when the widget is hidden, when every medication is ready or paused, and when a fullscreen or presentation-mode app is in front — the last via `SHQueryUserNotificationState`, which skips the repaint while still ticking, because the tick is what notices the fullscreen app leaving. A plain maximised window on top is not detected; that ceiling is marked with a `ponytail:` comment in the source.
+
+### Progress text contrast
+
+The countdown sits over a bar whose fill is bright and whose track is dark, so a single text colour could not stay legible across the sweep. It is now drawn twice against a clip at the fill edge, each half coloured by `contrasting_text()`, which picks dark or light from the Rec. 709 luma of whatever is beneath. A glyph crossing the boundary splits mid-character. Both the fill and the clip take the edge from one shared `progress_fraction()`, so they cannot drift apart. `DUE` keeps its red rather than deferring to the generic rule, since that colour is a state signal.

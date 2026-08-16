@@ -405,15 +405,34 @@ std::wstring status_text(const Medication& medication, const std::chrono::system
     return medication.is_soon_at(now) ? L"SOON" : L"";
 }
 
+// Seconds-precision remaining time, derived from the same stored anchor the model uses. This is a
+// display concern only: nothing seconds-level is ever persisted.
+std::chrono::seconds remaining_seconds(
+    const Medication& medication, const std::chrono::system_clock::time_point now) {
+    const auto next = medication.next_available_at();
+    if (!next || *next <= now) return std::chrono::seconds::zero();
+    return std::chrono::ceil<std::chrono::seconds>(*next - now);
+}
+
 std::wstring countdown_text(const Medication& medication, const std::chrono::system_clock::time_point now) {
     if (!medication.enabled) return L"PAUSED";
-    const std::chrono::minutes remaining = medication.remaining_at(now);
-    if (remaining == std::chrono::minutes::zero()) return L"DUE";
+    if (medication.remaining_at(now) == std::chrono::minutes::zero()) return L"DUE";
+    const std::chrono::seconds remaining = remaining_seconds(medication, now);
     const auto hours = std::chrono::duration_cast<std::chrono::hours>(remaining);
-    const auto minutes = remaining - hours;
-    return hours == std::chrono::hours::zero()
-               ? std::to_wstring(minutes.count()) + L"m"
-               : std::to_wstring(hours.count()) + L"h " + std::to_wstring(minutes.count()) + L"m";
+    const auto minutes = std::chrono::duration_cast<std::chrono::minutes>(remaining - hours);
+    const auto seconds = remaining - hours - minutes;
+    // Hours unpadded and dropped when zero; below an hour it is always MM:SS. 1:20:00, 20:05, 00:45.
+    std::array<wchar_t, 32> text{};
+    if (hours.count() > 0) {
+        swprintf(
+            text.data(), text.size(), L"%lld:%02lld:%02lld", static_cast<long long>(hours.count()),
+            static_cast<long long>(minutes.count()), static_cast<long long>(seconds.count()));
+    } else {
+        swprintf(
+            text.data(), text.size(), L"%02lld:%02lld", static_cast<long long>(minutes.count()),
+            static_cast<long long>(seconds.count()));
+    }
+    return text.data();
 }
 
 std::wstring local_timestamp_text(
@@ -437,6 +456,16 @@ std::wstring local_timestamp_text(
     return std::wstring{prefix} + date.data() + L" " + time.data();
 }
 
+// ponytail: SHQueryUserNotificationState only catches fullscreen/presentation apps, not a plain
+// maximised window sitting on top. Swap for a WM_PAINT-driven dirty flag if that matters.
+bool countdown_is_worth_drawing(const HWND window) {
+    if (!IsWindowVisible(window)) return false;
+    QUERY_USER_NOTIFICATION_STATE state{};
+    if (FAILED(SHQueryUserNotificationState(&state))) return true;
+    return state != QUNS_BUSY && state != QUNS_RUNNING_D3D_FULL_SCREEN &&
+           state != QUNS_PRESENTATION_MODE;
+}
+
 void schedule_refresh(const HWND window) {
     KillTimer(window, refresh_timer);
     if (!IsWindowVisible(window)) return;
@@ -444,7 +473,9 @@ void schedule_refresh(const HWND window) {
     if (std::ranges::any_of(medications, [now](const Medication& medication) {
             return medication.enabled && medication.remaining_at(now) > std::chrono::minutes::zero();
         })) {
-        SetTimer(window, refresh_timer, 60'000, nullptr);
+        // The countdown shows seconds, so it has to tick every second while a countdown is on
+        // screen. Hidden and all-ready/paused states still schedule nothing at all.
+        SetTimer(window, refresh_timer, 1'000, nullptr);
     }
 }
 
@@ -815,6 +846,29 @@ void set_hovered_icon(const HWND window, const std::optional<std::size_t> index)
         if (!index) fading_icon.reset();
         invalidate_icon_tile(window, index ? index : previous);
     }
+}
+
+// Rec. 709 luma, which is enough to decide whether a surface wants dark or light text on it.
+bool is_light_color(const COLORREF color) {
+    const float luma = 0.2126F * static_cast<float>(GetRValue(color)) +
+                       0.7152F * static_cast<float>(GetGValue(color)) +
+                       0.0722F * static_cast<float>(GetBValue(color));
+    return luma > 140.0F;
+}
+
+COLORREF contrasting_text(const COLORREF background) {
+    return is_light_color(background) ? surface_base : text_primary;
+}
+
+// Shared by the bar fill and the text clip so the split lands on exactly the same pixel.
+double progress_fraction(
+    const Medication& medication, const std::chrono::system_clock::time_point now) {
+    if (!medication.enabled) return 1.0;
+    const std::chrono::minutes remaining = medication.remaining_at(now);
+    if (remaining <= std::chrono::minutes::zero() || medication.interval.count() <= 0) return 0.0;
+    return std::clamp(
+        static_cast<double>(remaining.count()) / static_cast<double>(medication.interval.count()),
+        0.0, 1.0);
 }
 
 COLORREF blend_color(const COLORREF from, const COLORREF to, const float amount) {
@@ -1295,12 +1349,7 @@ void render_redesigned_widget(
                                         : soon  ? progress_soon
                                                 : progress_normal;
                 fill_shape(d2d_render_target, brush, layout.progress_bar, progress_track);
-                double progress = paused ? 1.0 : 0.0;
-                if (medication.enabled && remaining > std::chrono::minutes::zero() && medication.interval.count() > 0) {
-                    progress = static_cast<double>(remaining.count()) /
-                               static_cast<double>(medication.interval.count());
-                }
-                progress = std::clamp(progress, 0.0, 1.0);
+                const double progress = progress_fraction(medication, now);
                 if (progress > 0.0) {
                     RoundedShape progress_fill = layout.progress_bar;
                     progress_fill.bounds.right = progress_fill.bounds.left +
@@ -1425,14 +1474,35 @@ void render_redesigned_widget(
             DrawText(device, state.c_str(), -1, &badge, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         }
 
-        RECT bar_text = pixel_rect(layout.progress_text);
+        const RECT bar_text = pixel_rect(layout.progress_text);
         const std::wstring text = hovered_bar == index ? local_timestamp_text(medication, now)
                                                        : countdown_text(medication, now);
-        SetTextColor(device, due ? accent_due_text : text_primary);
         SelectObject(device, countdown_font);
-        DrawText(
-            device, text.c_str(), -1, &bar_text,
-            DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+        // The countdown can straddle the boundary between the bar fill and the empty track, which
+        // are very different luminances. Draw it twice, clipped either side of the fill edge, so
+        // each part contrasts the pixels actually beneath it -- including mid-glyph.
+        const RECT bar = pixel_rect(layout.progress_bar.bounds);
+        const auto fill_edge = static_cast<LONG>(std::lround(
+            static_cast<double>(bar.left) +
+            static_cast<double>(bar.right - bar.left) * progress_fraction(medication, now)));
+        const COLORREF over_fill = contrasting_text(
+            paused                       ? progress_paused
+            : due                        ? progress_due
+            : medication.is_soon_at(now) ? progress_soon
+                                         : progress_normal);
+        const COLORREF over_track = due ? accent_due_text : contrasting_text(progress_track);
+        const UINT format = DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS;
+        const auto draw_clipped = [&](const LONG left, const LONG right, const COLORREF color) {
+            if (left >= right) return;
+            const int saved = SaveDC(device);
+            IntersectClipRect(device, left, bar.top - 1, right, bar.bottom + 1);
+            SetTextColor(device, color);
+            RECT clipped = bar_text;
+            DrawText(device, text.c_str(), -1, &clipped, format);
+            RestoreDC(device, saved);
+        };
+        draw_clipped(bar_text.left, fill_edge, over_fill);
+        draw_clipped(fill_edge, bar_text.right, over_track);
 
         const HWND taken_button = GetDlgItem(window, first_taken_button_id + static_cast<int>(index));
         SetTextColor(device, IsWindowEnabled(taken_button) ? text_primary : text_muted);
@@ -1770,7 +1840,9 @@ LRESULT CALLBACK window_procedure(const HWND window, const UINT message, const W
         }
         if (w_param == refresh_timer) {
             schedule_refresh(window);
-            InvalidateRect(window, nullptr, FALSE);
+            // Keep ticking but skip the repaint nobody can see: the bare timer costs nothing, and
+            // it is what notices the fullscreen app going away.
+            if (countdown_is_worth_drawing(window)) InvalidateRect(window, nullptr, FALSE);
             return 0;
         }
         if (w_param == icon_fade_timer) {
