@@ -1,4 +1,5 @@
 #include "resource.h"
+#include "blur.h"
 #include "storage.h"
 #include "startup.h"
 
@@ -25,6 +26,12 @@
 #include <string>
 #include <utility>
 #include <vector>
+
+// MinGW's winuser.h predates this style. It is the documented "no redirection surface" bit, which
+// the composition presentation path requires so transparent pixels are not covered.
+#ifndef WS_EX_NOREDIRECTIONBITMAP
+#define WS_EX_NOREDIRECTIONBITMAP 0x00200000L
+#endif
 
 namespace {
 constexpr wchar_t window_class[] = L"MedAurasWindow";
@@ -68,6 +75,9 @@ struct DesignTokens {
     // The progress bar below is a capsule, so its rounded ends make its apparent left edge sit
     // right of its true bounds. This nudges the text line to look flush with it.
     float info_left_inset{3.0F};
+    // Live backdrop blur behind each card. These are the only two knobs; tune one at a time.
+    float blur_amount{20.0F};
+    float blur_tint_opacity{0.39F};
     float action_area_left{312.0F};
     float action_button_padding{5.0F};
     float taken_button_size{36.0F};
@@ -96,6 +106,9 @@ constexpr COLORREF accent_due = RGB(229, 77, 83);
 constexpr COLORREF accent_soon = RGB(232, 169, 66);
 constexpr COLORREF accent_due_text = RGB(244, 104, 110);
 constexpr COLORREF focus_ring = RGB(212, 212, 216);
+// Neutral dark tint laid over the blurred backdrop. Only used when the composition path is live;
+// without it the card falls back to its opaque surface gradient.
+constexpr COLORREF blur_tint = RGB(0, 0, 0);
 
 // Progress bar colours are kept separate from the neutral surface ramp: the bar carries state, so
 // it is intentionally the one chromatic element on an otherwise grey card.
@@ -1023,9 +1036,15 @@ LRESULT CALLBACK action_button_procedure(
 }
 
 bool create_action_buttons(const HWND window) {
+    // The tooltip is deliberately not owned by the widget. Giving a WS_EX_NOREDIRECTIONBITMAP
+    // window an owned top-most popup makes DWM stop presenting that window's composition target
+    // entirely -- the cards simply vanish. Ownership buys nothing here: TTM_ADDTOOL names the
+    // widget as the tool window and TTF_SUBCLASS does the message relaying, both independent of
+    // the tooltip's owner. WS_EX_TOOLWINDOW keeps the ownerless popup out of the taskbar.
     tooltip_window = CreateWindowEx(
-        WS_EX_TOPMOST, TOOLTIPS_CLASS, nullptr, WS_POPUP | TTS_ALWAYSTIP | TTS_NOPREFIX,
-        CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, window, nullptr,
+        WS_EX_TOPMOST | WS_EX_TOOLWINDOW, TOOLTIPS_CLASS, nullptr,
+        WS_POPUP | TTS_ALWAYSTIP | TTS_NOPREFIX,
+        CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, nullptr, nullptr,
         GetModuleHandle(nullptr), nullptr);
     for (std::size_t index = 0; index < medications.size(); ++index) {
         const RowLayout layout = row_layout(index);
@@ -1308,9 +1327,13 @@ void render_redesigned_widget(
     ID2D1SolidColorBrush* brush{};
     if (begin_d2d(device, client, &brush, D2D1_ALPHA_MODE_PREMULTIPLIED)) {
         d2d_render_target->Clear(D2D1::ColorF(0.0F, 0.0F, 0.0F, 0.0F));
+        // With the composition path live, the card interior is the blurred backdrop plus its tint,
+        // published beneath this frame. Painting a fill here would hide it, so only the border and
+        // the card's contents are drawn. Everything below stays fully opaque.
+        const bool blurred_cards = blur::active();
         if (medications.empty()) {
             const RoundedShape card = empty_card_layout();
-            fill_gradient(d2d_render_target, card, surface_raised, surface_base);
+            if (!blurred_cards) fill_gradient(d2d_render_target, card, surface_raised, surface_base);
             stroke_shape(d2d_render_target, brush, card, border_hairline);
         } else {
             for (std::size_t index = 0; index < medications.size(); ++index) {
@@ -1321,10 +1344,12 @@ void render_redesigned_widget(
                 const bool soon = medication.is_soon_at(now);
                 const bool paused = !medication.enabled;
 
-                fill_gradient(
-                    d2d_render_target, layout.card,
-                    paused ? surface_raised_paused : surface_raised,
-                    paused ? surface_base_paused : surface_base);
+                if (!blurred_cards) {
+                    fill_gradient(
+                        d2d_render_target, layout.card,
+                        paused ? surface_raised_paused : surface_raised,
+                        paused ? surface_base_paused : surface_base);
+                }
                 stroke_shape(d2d_render_target, brush, layout.card, border_hairline);
                 // The tile is the edit affordance, so it lights to the same hot surface as the
                 // action button. It rides the pencil's fade so both arrive together.
@@ -1516,6 +1541,26 @@ void render_redesigned_widget(
     }
 }
 
+// The blur visuals are placed from the same RowLayout the drawing and hit testing use, so a card's
+// painted border and its blurred interior cannot drift apart.
+void update_blur_geometry() {
+    if (!blur::active()) return;
+    const float card_height = medications.empty() ? design.empty_height : design.row_height;
+    std::vector<POINT> origins;
+    origins.reserve(std::max<std::size_t>(medications.size(), 1));
+    if (medications.empty()) {
+        origins.push_back(POINT{pixels(empty_card_layout().bounds.left), pixels(empty_card_layout().bounds.top)});
+    } else {
+        for (std::size_t index = 0; index < medications.size(); ++index) {
+            const D2D1_RECT_F card = row_layout(index).card.bounds;
+            origins.push_back(POINT{pixels(card.left), pixels(card.top)});
+        }
+    }
+    blur::set_cards(
+        origins.data(), origins.size(), widget_width(), pixels(card_height),
+        static_cast<float>(pixels(design.card_radius)));
+}
+
 void paint_redesigned_widget(const HWND window) {
     PAINTSTRUCT paint{};
     // The frame is rendered into an offscreen DIB and published with UpdateLayeredWindow, so the
@@ -1552,13 +1597,23 @@ void paint_redesigned_widget(const HWND window) {
     std::memset(bits, 0, static_cast<std::size_t>(width) * static_cast<std::size_t>(height) * 4);
     render_redesigned_widget(window, memory, client, static_cast<BYTE*>(bits), width, height);
 
-    RECT window_bounds{};
-    GetWindowRect(window, &window_bounds);
-    POINT destination{window_bounds.left, window_bounds.top};
-    POINT source{};
-    SIZE size{width, height};
-    BLENDFUNCTION blend{AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
-    UpdateLayeredWindow(window, screen, &destination, &size, memory, &source, 0, &blend, ULW_ALPHA);
+    // Composition owns presentation when the blur path came up: the same bitmap becomes the
+    // foreground layer above the blurred card visuals. Otherwise the original layered-window
+    // publish is used unchanged.
+    bool published = false;
+    if (blur::active()) {
+        update_blur_geometry();
+        published = blur::publish(bits, width, height);
+    }
+    if (!published) {
+        RECT window_bounds{};
+        GetWindowRect(window, &window_bounds);
+        POINT destination{window_bounds.left, window_bounds.top};
+        POINT source{};
+        SIZE size{width, height};
+        BLENDFUNCTION blend{AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
+        UpdateLayeredWindow(window, screen, &destination, &size, memory, &source, 0, &blend, ULW_ALPHA);
+    }
 
     SelectObject(memory, previous);
     DeleteObject(bitmap);
@@ -1729,6 +1784,25 @@ LRESULT CALLBACK window_procedure(const HWND window, const UINT message, const W
         }
         return 0;
     }
+    case WM_NCHITTEST: {
+        // A layered window let clicks fall through its zero-alpha pixels on its own. The
+        // composition window has no such rule, so the card shapes -- the same ones used for
+        // drawing and for the blur clip -- decide what the widget claims. Rounded corners and the
+        // gaps between rows reach the desktop either way.
+        POINT point{
+            static_cast<LONG>(static_cast<short>(LOWORD(l_param))),
+            static_cast<LONG>(static_cast<short>(HIWORD(l_param))),
+        };
+        ScreenToClient(window, &point);
+        const D2D1_POINT_2F dip_point = D2D1::Point2F(dips(point.x), dips(point.y));
+        if (medications.empty()) {
+            return contains(empty_card_layout(), dip_point) ? HTCLIENT : HTTRANSPARENT;
+        }
+        for (std::size_t index = 0; index < medications.size(); ++index) {
+            if (contains(row_layout(index).card, dip_point)) return HTCLIENT;
+        }
+        return HTTRANSPARENT;
+    }
     case WM_SETCURSOR: {
         // The icon tile is clickable but is painted, not a control, so it needs its own cursor.
         POINT point{};
@@ -1865,6 +1939,7 @@ LRESULT CALLBACK window_procedure(const HWND window, const UINT message, const W
         KillTimer(window, icon_fade_timer);
         KillTimer(window, focus_fade_timer);
         release_renderer();
+        blur::shutdown();
         remove_tray_icon(window);
         clear_medication_icons();
         PostQuitMessage(0);
@@ -1941,13 +2016,31 @@ int WINAPI wWinMain(const HINSTANCE instance, HINSTANCE, PWSTR, const int show_c
     const POINT initial_position = has_saved_position
                                        ? clamped_widget_position({*widget_settings.window_x, *widget_settings.window_y})
                                        : POINT{CW_USEDEFAULT, CW_USEDEFAULT};
+    // The two presentation paths need different window styles, and the style is fixed at creation,
+    // so the compositor and its effect graph are built first. Composition needs the window to keep
+    // no redirection surface; the layered fallback needs WS_EX_LAYERED. Only one of them is ever
+    // live for the lifetime of the process.
+    const bool composition_ready = blur::initialize(blur::Tokens{
+        .blur_amount = design.blur_amount,
+        .tint_opacity = design.blur_tint_opacity,
+        .tint_red = GetRValue(blur_tint),
+        .tint_green = GetGValue(blur_tint),
+        .tint_blue = GetBValue(blur_tint),
+    });
     const HWND window = CreateWindowEx(
-        WS_EX_TOOLWINDOW | WS_EX_CONTROLPARENT | WS_EX_LAYERED |
+        WS_EX_TOOLWINDOW | WS_EX_CONTROLPARENT |
+            (composition_ready ? WS_EX_NOREDIRECTIONBITMAP : WS_EX_LAYERED) |
             (widget_settings.always_on_top ? WS_EX_TOPMOST : 0),
         window_class,
         L"Medication Cooldown Widget", WS_POPUP | WS_CLIPCHILDREN, initial_position.x, initial_position.y, widget_width(),
         widget_height(), nullptr, nullptr, instance, nullptr);
     if (!window) return 1;
+    if (composition_ready && !blur::attach(window)) {
+        // The tree could not be bound after the device came up. The window has no redirection
+        // surface, so give it the layered path instead of leaving nothing to present into.
+        SetWindowLongPtr(
+            window, GWL_EXSTYLE, GetWindowLongPtr(window, GWL_EXSTYLE) | WS_EX_LAYERED);
+    }
 
     const UINT initial_dpi = window_dpi(window);
     if (initial_dpi != widget_dpi) {

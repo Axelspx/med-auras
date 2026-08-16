@@ -292,8 +292,14 @@ awareness.
 Work since then is the post-MVP UI redesign recorded in `docs/DESIGN_PLAN.md`, which remains the authoritative record
 for visual decisions. Current rendering state:
 
-- One layered top-level window. Each frame is drawn into a premultiplied 32-bit DIB and published with
-  `UpdateLayeredWindow`, so Direct2D owns per-pixel alpha and card corners and row gaps are anti-aliased.
+- One borderless top-level window. Each frame is drawn into a premultiplied 32-bit DIB, so Direct2D owns per-pixel
+  alpha and card corners and row gaps are anti-aliased.
+- Cards sit on a live Gaussian-blurred backdrop supplied by Windows Composition (`src/blur.cpp`). The window is
+  `WS_EX_NOREDIRECTIONBITMAP` with a desktop window target; the DIB is uploaded to a composition surface above two
+  masked sprite visuals per card. If composition fails to initialize the window is created `WS_EX_LAYERED` instead
+  and the original `UpdateLayeredWindow` path runs with opaque card fills. Do not give this window an owned popup:
+  an owned top-most popup makes DWM stop presenting its composition target, which is why the tooltip has no owner.
+  See `docs/DESIGN_PLAN.md`.
 - Geometry is floating-point DIP, centralized in `DesignTokens` and resolved once per row by `RowLayout`. Drawing,
   native child placement, hover detection, and hit testing all consume that same layout.
 - Colour is centralized alongside it as a neutral grey ramp with chromatic status accents.
@@ -308,7 +314,11 @@ for visual decisions. Current rendering state:
 
 Selectable Solid/Mica/Acrylic background materials were implemented and then removed. Do not reintroduce a DWM
 system backdrop, `SetWindowRgn` silhouette, or second presentation path without reading the withdrawal rationale in
-`docs/DESIGN_PLAN.md` first.
+`docs/DESIGN_PLAN.md` first. The per-card composition blur is not a reversal of that: it is app-owned, per card, and
+leaves the row gaps genuinely transparent.
+
+Hosting Direct3D 11 and the composition runtime costs roughly 59 MB private memory and about 69 threads, up from
+7 MB and 1. CPU is unaffected (slightly lower than before). That trade is documented rather than assumed.
 
 ## Definition of Done for MVP
 

@@ -620,3 +620,106 @@ Cost, measured: **about 0.7% of one core** while a countdown is visible. It retu
 ### Progress text contrast
 
 The countdown sits over a bar whose fill is bright and whose track is dark, so a single text colour could not stay legible across the sweep. It is now drawn twice against a clip at the fill edge, each half coloured by `contrasting_text()`, which picks dark or light from the Rec. 709 luma of whatever is beneath. A glyph crossing the boundary splits mid-character. Both the fill and the clip take the edge from one shared `progress_fraction()`, so they cannot drift apart. `DUE` keeps its red rather than deferring to the generic rule, since that colour is a state signal.
+
+## Live backdrop blur behind the cards (2026-08-16)
+
+Status: **implemented**
+
+Implements `docs/BLUR_IMPLEMENTATION.md`: each medication card now shows a live, Gaussian-blurred view of whatever
+is behind the widget, tinted dark, clipped to the card's rounded shape. The gaps between cards stay fully
+transparent and the foreground stays sharp. Nothing captures the screen, and no DWM injection is involved.
+
+This is the first change since the 2026-08-14 withdrawal to reintroduce a see-through material. It is not a
+reversal of that decision: what was withdrawn was a *system backdrop* (`DWMWA_SYSTEMBACKDROP_TYPE`) applied to the
+whole window, which could not coexist with per-pixel-transparent gaps and cost more than a full core in `dwm.exe`
+during drags. What is added here is an app-owned composition visual per card. The `SetWindowRgn` silhouette and the
+second presentation path stay gone.
+
+### Why the renderer had to change
+
+A layered window presents only the bitmap given to `UpdateLayeredWindow`. A `CompositionBackdropBrush` samples what
+the compositor has behind the window, which a layered window's bitmap can never contain. The two are mutually
+exclusive, so the widget moves to a composition target:
+
+- the top-level window is created `WS_EX_NOREDIRECTIONBITMAP` instead of `WS_EX_LAYERED`;
+- `ICompositorDesktopInterop::CreateDesktopWindowTarget` binds a visual tree to it, above the child controls;
+- the existing frame is rendered exactly as before — Direct2D geometry into a premultiplied DIB, then the GDI text
+  and icon pass — and that finished bitmap is uploaded into a composition drawing surface instead of being handed
+  to `UpdateLayeredWindow`.
+
+The drawing code is untouched. Only the publish step changed, which is why the text pipeline, baseline alignment,
+progress-text clipping, and DPI behaviour all carry over unchanged rather than being ported to DirectWrite.
+
+### Effect graph
+
+Deliberately the smallest thing that matches the reference:
+
+```text
+CompositionBackdropBrush -> D2D1GaussianBlur (sd 20, HARD, SPEED) -> CompositionEffectBrush
+```
+
+`Windows.UI.Composition` consumes an effect through `IGraphicsEffectD2D1Interop`, which `blur.cpp` implements
+directly. That avoids Win2D and keeps the dependency list unchanged apart from `d3d11`/`dxgi`/`dxguid`.
+
+**The dark tint is a separate composition brush, not a node in the graph.** The reference recipe composites the tint
+inside the effect; doing that here would have been equivalent only if the tint stayed off the foreground. Because
+the card's own text and icons are drawn into the same bitmap, giving the card a translucent fill would have made the
+text translucent with it — GDI does not write alpha, so the text inherits whatever alpha the fill left behind. Two
+masked sprite visuals per card (blur, then tint) put the translucency entirely below the foreground layer, and cost
+less code than hand-writing `Composite` and `Flood` effect classes.
+
+### Rounded corners
+
+Each card layer is a `CompositionMaskBrush` whose mask is one shared drawing surface containing the card silhouette,
+filled with `FillRoundedRectangle`. A composition clip would have given binary edges — precisely the defect that
+Option B existed to remove. All cards are the same size, so one mask surface and two brushes serve every card; only
+the sprite visuals are per-card.
+
+Geometry comes from the same `RowLayout` that drawing and hit testing use, so the painted border and the blurred
+interior cannot drift apart at any DPI.
+
+### Hit testing
+
+A layered window passed clicks through its zero-alpha pixels for free. A composition window does not, so
+`WM_NCHITTEST` now returns `HTTRANSPARENT` for anything outside the card shapes, using the same `contains()` test as
+the rest of the widget. Verified: card bodies `HTCLIENT`, row gaps and rounded corners `HTTRANSPARENT`, the Taken
+button still resolves to control ID 100.
+
+### The tooltip defect
+
+Composition initialised cleanly, every call returned `S_OK`, the visual tree reported its children — and the window
+presented nothing. A standalone window with identical styles worked, and so did a second window created inside the
+running app, which narrowed it to the widget window itself. Bisecting the window procedure found it in `WM_CREATE`:
+
+**Giving a `WS_EX_NOREDIRECTIONBITMAP` window an owned top-most popup makes DWM stop presenting that window's
+composition target entirely.** The popup was the tooltip control, owned by the widget since the MVP.
+
+The fix is to create the tooltip with no owner. Ownership bought nothing: `TTM_ADDTOOL` names the widget as the tool
+window and `TTF_SUBCLASS` does the message relaying, both independent of the tooltip's owner. `WS_EX_TOOLWINDOW`
+keeps the ownerless popup out of the taskbar. Tooltips still work.
+
+Worth remembering when adding any future owned popup to this window.
+
+### Fallback
+
+If any part of the path is unavailable — no `CoreMessaging`/`combase` entry points, no Direct3D device, no
+compositor, no backdrop brush — `blur::initialize` reports failure *before the window is created*, so the window
+takes `WS_EX_LAYERED` and the original `UpdateLayeredWindow` path runs with the opaque card gradient restored. The
+ordering matters: the window's extended style is fixed at creation. Verified by forcing initialisation to fail: the
+widget renders exactly as it did before this change. Failures are logged with `OutputDebugString` in debug builds.
+
+### Resource cost, measured
+
+| | before | after |
+|---|---|---|
+| CPU, visible with a running countdown | ~0.7% of one core | **0.47%** of one core |
+| private memory | ~7 MB | **59 MB** |
+| threads | 1 | **~69** |
+
+CPU went *down*: uploading the frame to a composition surface is cheaper than `UpdateLayeredWindow`. No new timer,
+poll, or redraw loop exists — the compositor keeps the backdrop live on its own, so the widget still repaints only
+for the countdown tick, and handles stayed flat at 531 over the sample.
+
+Memory and thread count are the real cost, and they are substantial against this project's stated mission. They are
+inherent to hosting a Direct3D 11 device and the composition runtime in-process, not something the paint path can
+reclaim. This is the trade the feature buys; it deserves a decision rather than an assumption.

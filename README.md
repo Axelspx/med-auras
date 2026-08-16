@@ -225,9 +225,16 @@ MedAuras MVP is complete. The automated, resource-usage, restart/sleep, and full
 
 ### Widget appearance
 
-The widget is a single layered window. Every frame is rendered into a premultiplied 32-bit DIB and published with
-`UpdateLayeredWindow`, so Direct2D supplies the authoritative per-pixel alpha and the rounded card corners and the gaps
-between rows are smoothly anti-aliased against the desktop. There is no window region and no DWM backdrop.
+The widget is a single borderless window whose frame is rendered into a premultiplied 32-bit DIB, so Direct2D supplies
+the authoritative per-pixel alpha and the rounded card corners and the gaps between rows are smoothly anti-aliased
+against the desktop. There is no window region and no DWM system backdrop.
+
+Each card shows a live, Gaussian-blurred view of whatever is behind the widget, darkened by a neutral tint and clipped
+to the card's rounded shape. That comes from Windows Composition: a backdrop brush feeds a blur effect, and two masked
+sprite visuals per card sit beneath the frame, which is uploaded to a composition surface rather than published with
+`UpdateLayeredWindow`. Nothing captures the screen and the compositor keeps the blur current without the app
+repainting. If composition is unavailable the window falls back to `WS_EX_LAYERED`/`UpdateLayeredWindow` with the
+original opaque card gradient. Blur strength and tint opacity are design tokens (`blur_amount`, `blur_tint_opacity`).
 
 Cards are 364 × 66 DIP and use a flat neutral grey ramp with hairline borders at roughly 12% white. Text steps
 primary, secondary, muted; `SOON`, `DUE`, and `PAUSED` keep chromatic accents so state is never signalled by grey
@@ -290,6 +297,11 @@ After the seconds countdown was added, a 20-second sample with a running countdo
 of one core) and a 90-second sample held handles flat at 218 with private memory oscillating between roughly 6.6 and
 7.5 MB. Cursor parked on the icon tile, on the Taken button, and away from the widget each measured 0 ms over 8
 seconds, confirming the hover and focus transitions settle rather than run continuously.
+
+After live backdrop blur was added, a 20-second Release sample with a running countdown measured 94 ms of CPU (about
+0.47% of one core, lower than before, since a composition-surface upload is cheaper than `UpdateLayeredWindow`) with
+handles flat at 531. Hosting a Direct3D 11 device and the composition runtime raised private memory from roughly 7 MB
+to 59 MB and thread count from 1 to about 69. No new timer, poll, or redraw loop was introduced.
 
 ## Status Styling
 
