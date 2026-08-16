@@ -723,3 +723,65 @@ for the countdown tick, and handles stayed flat at 531 over the sample.
 Memory and thread count are the real cost, and they are substantial against this project's stated mission. They are
 inherent to hosting a Direct3D 11 device and the composition runtime in-process, not something the paint path can
 reclaim. This is the trade the feature buys; it deserves a decision rather than an assumption.
+
+## User-configurable card background (2026-08-16)
+
+Status: **implemented**
+
+The card background is now a user setting: solid or blurred, with an RGBA colour. Reached from the row context menu
+via **Background...**, and stored in the existing settings block rather than a new file.
+
+### Why the settings live in the JSON
+
+The request was posed as either a separate INI file or a settings UI. A second config file was declined: the widget
+already has `WidgetSettings` in `medications.json`, already human-readable, already atomically written, and already
+tolerant of unknown keys — the same tolerance that let `background_material` be dropped cleanly when materials were
+withdrawn. A parallel INI would have meant a second parser and a second save path for one feature. Hand-editing the
+JSON gives the same result the INI was wanted for:
+
+```json
+"background_blur": true,
+"background_color": { "r": 0, "g": 0, "b": 0, "a": 99 }
+```
+
+Missing keys take the defaults, which reproduce the appearance the blur was originally tuned with — black at alpha
+99, the 0.39 tint. Files written before this change load unchanged.
+
+### Solid is a composition layer, not a painted fill
+
+The important consequence, and the reason the UI was worth building rather than shipping the file alone: **a
+translucent card cannot be painted into the frame.** The widget's text and icons are drawn into the same premultiplied
+DIB, and GDI does not write the alpha byte, so a card fill at alpha 99 would drag the medication names down to 39%
+opacity with it. This is the same constraint that put the blur tint in a composition brush.
+
+So solid mode is the blur tree minus the blurred layer:
+
+```text
+blur   = blurred backdrop sprite + colour sprite
+solid  =                           colour sprite
+```
+
+One mask, one colour brush, one code path, and alpha is meaningful in both modes because the translucent layers sit
+strictly below the foreground. Changing colour or opacity only sets a brush property; only switching mode rebuilds
+the visual tree.
+
+`create_card_brushes` was split so the blur brush can fail on its own. A machine that cannot build the Gaussian
+effect still gets solid backgrounds with working alpha instead of losing composition altogether, and
+`blur::blur_supported()` reports the difference so the dialog can disable the Blur option rather than offering a
+setting that silently does nothing.
+
+### Fallback
+
+Without composition there is no translucency to configure at all, so the **Background...** menu item is shown
+greyed rather than hidden — the capability exists, this machine cannot offer it — and the widget keeps its opaque
+card gradient.
+
+### Live preview
+
+Every control previews on the real widget immediately; **Cancel** restores the entry state and **Save** persists.
+Blur tint is a judge-by-eye setting, and editing a file, saving, and relaunching to evaluate it is not a workable
+loop.
+
+Owned popups were a live concern here, since an owned tooltip is what broke composition during the blur work. A
+modal dialog behaves differently and was verified explicitly: the widget keeps rendering while the dialog is open,
+which is what makes live preview possible, and composition survives the dialog closing.

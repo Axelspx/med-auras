@@ -17,15 +17,23 @@ namespace blur {
 struct Tokens {
     // Gaussian standard deviation in pixels. Tune this alone; leave the tint fixed while you do.
     float blur_amount;
-    float tint_opacity;
-    BYTE tint_red;
-    BYTE tint_green;
-    BYTE tint_blue;
 };
 
 // Creates the compositor, rendering device, and shared brushes. No window is involved yet, so the
 // caller can choose the window's extended style from the result.
+//
+// Succeeds as long as composition itself works. The Gaussian blur is a separate question: if only
+// the effect brush fails, this still returns true and the widget runs in solid mode.
 bool initialize(const Tokens& tokens);
+
+// Whether the blurred-backdrop layer is available. False means only solid backgrounds can be
+// offered, and the caller should not present blur as a choice.
+bool blur_supported();
+
+// Sets the card background. `blurred` adds the live blurred backdrop beneath the colour; the colour
+// is a tint over it when blurred, and the card itself when not. Cheap and idempotent: unchanged
+// values do no work, and a colour change alone does not rebuild the visual tree.
+void set_background(bool blurred, BYTE red, BYTE green, BYTE blue, BYTE alpha);
 
 // Binds the composition tree to a window. The window must not be WS_EX_LAYERED.
 bool attach(HWND window);

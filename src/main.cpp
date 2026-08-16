@@ -75,9 +75,9 @@ struct DesignTokens {
     // The progress bar below is a capsule, so its rounded ends make its apparent left edge sit
     // right of its true bounds. This nudges the text line to look flush with it.
     float info_left_inset{3.0F};
-    // Live backdrop blur behind each card. These are the only two knobs; tune one at a time.
+    // Gaussian standard deviation for the card backdrop blur. The colour over it is a user
+    // setting, not a token.
     float blur_amount{20.0F};
-    float blur_tint_opacity{0.39F};
     float action_area_left{312.0F};
     float action_button_padding{5.0F};
     float taken_button_size{36.0F};
@@ -106,9 +106,6 @@ constexpr COLORREF accent_due = RGB(229, 77, 83);
 constexpr COLORREF accent_soon = RGB(232, 169, 66);
 constexpr COLORREF accent_due_text = RGB(244, 104, 110);
 constexpr COLORREF focus_ring = RGB(212, 212, 216);
-// Neutral dark tint laid over the blurred backdrop. Only used when the composition path is live;
-// without it the card falls back to its opaque surface gradient.
-constexpr COLORREF blur_tint = RGB(0, 0, 0);
 
 // Progress bar colours are kept separate from the neutral surface ramp: the bar carries state, so
 // it is intentionally the one chromatic element on an otherwise grey card.
@@ -125,6 +122,7 @@ constexpr UINT edit_medication_command = 3;
 constexpr UINT add_medication_command = 4;
 constexpr UINT lock_position_command = 5;
 constexpr UINT always_on_top_command = 6;
+constexpr UINT background_command = 7;
 constexpr UINT tray_show_hide_command = 10;
 constexpr UINT tray_startup_command = 11;
 constexpr UINT tray_exit_command = 12;
@@ -399,6 +397,139 @@ bool edit_medication(const HWND owner, Medication& medication) {
     return DialogBoxParam(
                GetModuleHandle(nullptr), MAKEINTRESOURCE(IDD_MEDICATION_EDITOR), owner, medication_editor_procedure,
                reinterpret_cast<LPARAM>(&medication)) == IDOK;
+}
+
+void save_state();
+
+// Pushes the current background settings at the compositor and repaints. Used for both the live
+// preview while the dialog is open and the initial application at startup.
+void apply_background_settings(const HWND widget) {
+    blur::set_background(
+        widget_settings.background_blur, widget_settings.background_red,
+        widget_settings.background_green, widget_settings.background_blue,
+        widget_settings.background_alpha);
+    InvalidateRect(widget, nullptr, FALSE);
+}
+
+struct BackgroundEditor {
+    HWND widget;
+    WidgetSettings original;
+};
+
+void update_alpha_label(const HWND dialog) {
+    std::array<wchar_t, 16> text{};
+    swprintf(text.data(), text.size(), L"%u", static_cast<unsigned>(widget_settings.background_alpha));
+    SetDlgItemText(dialog, IDC_BACKGROUND_ALPHA_VALUE, text.data());
+}
+
+// Background is a look-at-it setting, so every control previews live on the real widget rather than
+// waiting for Save. Cancel restores what was there on entry.
+INT_PTR CALLBACK background_editor_procedure(
+    const HWND dialog, const UINT message, const WPARAM w_param, const LPARAM l_param) {
+    auto* editor = reinterpret_cast<BackgroundEditor*>(GetWindowLongPtr(dialog, GWLP_USERDATA));
+    switch (message) {
+    case WM_INITDIALOG: {
+        SetWindowLongPtr(dialog, GWLP_USERDATA, l_param);
+        editor = reinterpret_cast<BackgroundEditor*>(l_param);
+        CheckRadioButton(
+            dialog, IDC_BACKGROUND_SOLID, IDC_BACKGROUND_BLUR,
+            widget_settings.background_blur ? IDC_BACKGROUND_BLUR : IDC_BACKGROUND_SOLID);
+        if (!blur::blur_supported()) {
+            EnableWindow(GetDlgItem(dialog, IDC_BACKGROUND_BLUR), FALSE);
+            SetDlgItemText(
+                dialog, IDC_BACKGROUND_HINT, L"Blur is unavailable on this system; solid only.");
+        } else {
+            SetDlgItemText(
+                dialog, IDC_BACKGROUND_HINT, L"Opacity is how much of the card colour you see.");
+        }
+        SendDlgItemMessage(dialog, IDC_BACKGROUND_ALPHA, TBM_SETRANGE, TRUE, MAKELPARAM(0, 255));
+        SendDlgItemMessage(
+            dialog, IDC_BACKGROUND_ALPHA, TBM_SETPOS, TRUE, widget_settings.background_alpha);
+        update_alpha_label(dialog);
+        return TRUE;
+    }
+    case WM_DRAWITEM: {
+        const auto& item = *reinterpret_cast<const DRAWITEMSTRUCT*>(l_param);
+        if (item.CtlID != IDC_BACKGROUND_COLOR) break;
+        const HBRUSH fill = CreateSolidBrush(RGB(
+            widget_settings.background_red, widget_settings.background_green,
+            widget_settings.background_blue));
+        FillRect(item.hDC, &item.rcItem, fill);
+        DeleteObject(fill);
+        FrameRect(item.hDC, &item.rcItem, GetSysColorBrush(COLOR_BTNSHADOW));
+        if ((item.itemState & ODS_FOCUS) != 0) DrawFocusRect(item.hDC, &item.rcItem);
+        return TRUE;
+    }
+    case WM_HSCROLL: {
+        if (GetDlgItem(dialog, IDC_BACKGROUND_ALPHA) != reinterpret_cast<HWND>(l_param)) break;
+        widget_settings.background_alpha = static_cast<unsigned char>(
+            SendDlgItemMessage(dialog, IDC_BACKGROUND_ALPHA, TBM_GETPOS, 0, 0));
+        update_alpha_label(dialog);
+        if (editor) apply_background_settings(editor->widget);
+        return TRUE;
+    }
+    case WM_COMMAND:
+        switch (LOWORD(w_param)) {
+        case IDC_BACKGROUND_SOLID:
+        case IDC_BACKGROUND_BLUR:
+            widget_settings.background_blur =
+                IsDlgButtonChecked(dialog, IDC_BACKGROUND_BLUR) == BST_CHECKED;
+            if (editor) apply_background_settings(editor->widget);
+            return TRUE;
+        case IDC_BACKGROUND_COLOR: {
+            static std::array<COLORREF, 16> custom{};
+            CHOOSECOLOR choose{sizeof(CHOOSECOLOR)};
+            choose.hwndOwner = dialog;
+            choose.rgbResult = RGB(
+                widget_settings.background_red, widget_settings.background_green,
+                widget_settings.background_blue);
+            choose.lpCustColors = custom.data();
+            choose.Flags = CC_RGBINIT | CC_FULLOPEN;
+            if (ChooseColor(&choose)) {
+                widget_settings.background_red = GetRValue(choose.rgbResult);
+                widget_settings.background_green = GetGValue(choose.rgbResult);
+                widget_settings.background_blue = GetBValue(choose.rgbResult);
+                InvalidateRect(GetDlgItem(dialog, IDC_BACKGROUND_COLOR), nullptr, TRUE);
+                if (editor) apply_background_settings(editor->widget);
+            }
+            return TRUE;
+        }
+        case IDOK:
+            EndDialog(dialog, IDOK);
+            return TRUE;
+        case IDCANCEL:
+            if (editor) {
+                widget_settings = editor->original;
+                apply_background_settings(editor->widget);
+            }
+            EndDialog(dialog, IDCANCEL);
+            return TRUE;
+        default:
+            break;
+        }
+        break;
+    default:
+        break;
+    }
+    return FALSE;
+}
+
+void edit_background(const HWND window) {
+    BackgroundEditor editor{window, widget_settings};
+    if (DialogBoxParam(
+            GetModuleHandle(nullptr), MAKEINTRESOURCE(IDD_BACKGROUND), window,
+            background_editor_procedure, reinterpret_cast<LPARAM>(&editor)) != IDOK) {
+        return;
+    }
+    try {
+        save_state();
+    } catch (const std::exception&) {
+        widget_settings = editor.original;
+        apply_background_settings(window);
+        MessageBox(
+            window, L"The background settings could not be saved.", L"Medication Cooldown Widget",
+            MB_OK | MB_ICONERROR);
+    }
 }
 
 std::wstring new_medication_id() {
@@ -1694,6 +1825,11 @@ LRESULT CALLBACK window_procedure(const HWND window, const UINT message, const W
         AppendMenu(
             menu, MF_STRING | (widget_settings.always_on_top ? MF_CHECKED : MF_UNCHECKED),
             always_on_top_command, L"Always on top");
+        // Without composition there is no translucency to configure, so the item is shown disabled
+        // rather than hidden: the capability exists, this machine just cannot offer it.
+        AppendMenu(
+            menu, MF_STRING | (blur::active() ? MF_ENABLED : MF_GRAYED), background_command,
+            L"Background...");
         SetForegroundWindow(window);
         const UINT command = TrackPopupMenu(
             menu, TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON, point.x, point.y, 0, window, nullptr);
@@ -1769,6 +1905,8 @@ LRESULT CALLBACK window_procedure(const HWND window, const UINT message, const W
                     window, L"The position lock setting could not be saved.", L"Medication Cooldown Widget",
                     MB_OK | MB_ICONERROR);
             }
+        } else if (command == background_command) {
+            edit_background(window);
         } else if (command == always_on_top_command) {
             widget_settings.always_on_top = !widget_settings.always_on_top;
             apply_topmost(window);
@@ -2020,13 +2158,7 @@ int WINAPI wWinMain(const HINSTANCE instance, HINSTANCE, PWSTR, const int show_c
     // so the compositor and its effect graph are built first. Composition needs the window to keep
     // no redirection surface; the layered fallback needs WS_EX_LAYERED. Only one of them is ever
     // live for the lifetime of the process.
-    const bool composition_ready = blur::initialize(blur::Tokens{
-        .blur_amount = design.blur_amount,
-        .tint_opacity = design.blur_tint_opacity,
-        .tint_red = GetRValue(blur_tint),
-        .tint_green = GetGValue(blur_tint),
-        .tint_blue = GetBValue(blur_tint),
-    });
+    const bool composition_ready = blur::initialize(blur::Tokens{.blur_amount = design.blur_amount});
     const HWND window = CreateWindowEx(
         WS_EX_TOOLWINDOW | WS_EX_CONTROLPARENT |
             (composition_ready ? WS_EX_NOREDIRECTIONBITMAP : WS_EX_LAYERED) |
@@ -2041,6 +2173,7 @@ int WINAPI wWinMain(const HINSTANCE instance, HINSTANCE, PWSTR, const int show_c
         SetWindowLongPtr(
             window, GWL_EXSTYLE, GetWindowLongPtr(window, GWL_EXSTYLE) | WS_EX_LAYERED);
     }
+    apply_background_settings(window);
 
     const UINT initial_dpi = window_dpi(window);
     if (initial_dpi != widget_dpi) {

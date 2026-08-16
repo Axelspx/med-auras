@@ -277,7 +277,9 @@ struct State {
     // Shared across every card: one blurred-backdrop brush and one tint brush, each presented
     // through the same rounded-card alpha mask.
     ICompositionBrush* card_blur_brush{};
-    ICompositionBrush* card_tint_brush{};
+    ICompositionColorBrush* card_colour{};
+    ICompositionBrush* card_colour_brush{};
+    bool blur_enabled{};
     ICompositionDrawingSurface* mask_surface{};
 
     ICompositionDrawingSurface* content_surface{};
@@ -369,7 +371,11 @@ bool create_compositor() {
 }
 
 // Backdrop -> Gaussian blur -> effect brush. The compositor keeps the backdrop live on its own.
-bool create_card_brushes() {
+//
+// Kept separate from the colour brush and allowed to fail on its own: a machine that cannot build
+// the effect can still run solid backgrounds, which is a far better outcome than losing the whole
+// composition path and with it any translucency at all.
+bool create_blur_brush() {
     ICompositionBackdropBrush* backdrop{};
     HRESULT result = state.compositor2->CreateBackdropBrush(&backdrop);
     ICompositionBrush* backdrop_brush{};
@@ -416,37 +422,28 @@ bool create_card_brushes() {
     release(parameter_source);
     release(backdrop_brush);
 
-    ICompositionBrush* blurred{};
     if (SUCCEEDED(result)) {
-        result = effect_brush->QueryInterface(iid_composition_brush, reinterpret_cast<void**>(&blurred));
+        result = effect_brush->QueryInterface(
+            iid_composition_brush, reinterpret_cast<void**>(&state.card_blur_brush));
     }
     release(effect_brush);
+    if (FAILED(result)) log_failure(L"no backdrop effect brush", result);
+    return SUCCEEDED(result);
+}
 
-    // The tint is a plain colour brush laid over the blur inside the same card mask, rather than
-    // another node in the effect graph. Visually identical, and it keeps the card's text and icons
-    // out of any translucency: only these two composition layers are see-through.
-    ICompositionColorBrush* colour{};
-    ICompositionBrush* tint{};
+// The card colour: a tint over the blur in blur mode, and the card itself in solid mode. It is a
+// composition brush rather than a fill painted into the frame because that is the only way its
+// alpha can mean anything -- the widget's own text and icons are drawn into that frame, and GDI
+// does not write alpha, so a translucent painted fill would drag the text's opacity down with it.
+bool create_colour_brush() {
+    const HRESULT result = state.compositor->CreateColorBrushWithColor(
+        WinColor{0, 0, 0, 0}, &state.card_colour);
     if (SUCCEEDED(result)) {
-        const WinColor value{
-            static_cast<BYTE>(std::clamp(state.tokens.tint_opacity, 0.0F, 1.0F) * 255.0F + 0.5F),
-            state.tokens.tint_red, state.tokens.tint_green, state.tokens.tint_blue};
-        result = state.compositor->CreateColorBrushWithColor(value, &colour);
+        return SUCCEEDED(state.card_colour->QueryInterface(
+            iid_composition_brush, reinterpret_cast<void**>(&state.card_colour_brush)));
     }
-    if (SUCCEEDED(result)) {
-        result = colour->QueryInterface(iid_composition_brush, reinterpret_cast<void**>(&tint));
-    }
-    release(colour);
-
-    if (FAILED(result)) {
-        release(blurred);
-        release(tint);
-        log_failure(L"no backdrop effect brush", result);
-        return false;
-    }
-    state.card_blur_brush = blurred;
-    state.card_tint_brush = tint;
-    return true;
+    log_failure(L"no colour brush", result);
+    return false;
 }
 
 ICompositionDrawingSurface* create_surface(const int width, const int height) {
@@ -567,7 +564,10 @@ void rebuild_tree() {
     state.card_visuals.clear();
 
     for (const POINT origin : state.geometry.origins) {
-        for (ICompositionBrush* source : {state.card_blur_brush, state.card_tint_brush}) {
+        // Solid mode is the same tree without the blurred layer beneath.
+        const bool with_blur = state.blur_enabled && state.card_blur_brush;
+        for (ICompositionBrush* source : {with_blur ? state.card_blur_brush : nullptr, state.card_colour_brush}) {
+            if (!source) continue;
             IVisual* layer =
                 create_card_layer(source, origin, state.geometry.width, state.geometry.height);
             if (!layer) continue;
@@ -645,10 +645,12 @@ bool initialize(const Tokens& tokens) {
         shutdown();
         return false;
     }
-    if (!create_render_device() || !create_compositor() || !create_card_brushes()) {
+    if (!create_render_device() || !create_compositor() || !create_colour_brush()) {
         shutdown();
         return false;
     }
+    // A blur failure is not fatal; solid mode remains available.
+    static_cast<void>(create_blur_brush());
     state.ready = true;
     return true;
 }
@@ -693,6 +695,29 @@ bool attach(const HWND window) {
 
 bool active() {
     return state.ready && state.target != nullptr;
+}
+
+bool blur_supported() {
+    return state.ready && state.card_blur_brush != nullptr;
+}
+
+void set_background(
+    const bool blurred, const BYTE red, const BYTE green, const BYTE blue, const BYTE alpha) {
+    if (!state.ready) return;
+    // Asking for blur where the effect brush never built stays solid rather than going blank.
+    const bool wanted = blurred && state.card_blur_brush != nullptr;
+
+    WinColor current{};
+    state.card_colour->get_Color(&current);
+    const WinColor next{alpha, red, green, blue};
+    if (current.a != next.a || current.r != next.r || current.g != next.g || current.b != next.b) {
+        // A colour change is just a brush property: the tree, the mask, and the visuals all stand.
+        state.card_colour->put_Color(next);
+    }
+    if (wanted != state.blur_enabled) {
+        state.blur_enabled = wanted;
+        rebuild_tree();
+    }
 }
 
 void set_cards(
@@ -749,7 +774,8 @@ void shutdown() {
     release(state.content_surface);
     release(state.mask_surface);
     release(state.card_blur_brush);
-    release(state.card_tint_brush);
+    release(state.card_colour_brush);
+    release(state.card_colour);
     release(state.root);
     release(state.target);
     release(state.window_target);
@@ -763,6 +789,7 @@ void shutdown() {
     release(state.d2d_factory);
     release(state.d3d_device);
     state.geometry = CardGeometry{};
+    state.blur_enabled = false;
     state.content_width = 0;
     state.content_height = 0;
     state.ready = false;

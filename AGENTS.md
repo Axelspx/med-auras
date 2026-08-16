@@ -151,6 +151,7 @@ Keep uncommon actions out of the primary workflow:
 - drag widget
 - lock/unlock widget position
 - optional always-on-top
+- card background: solid/blur, colour, and opacity
 - system tray show/hide
 - settings
 - exit
@@ -306,6 +307,12 @@ for visual decisions. Current rendering state:
 
 - One borderless top-level window. Each frame is drawn into a premultiplied 32-bit DIB, so Direct2D owns per-pixel
   alpha and card corners and row gaps are anti-aliased.
+- The card background is a user setting — solid or blurred, with an RGBA colour — stored in the existing settings
+  block of `medications.json` as `background_blur` and `background_color`, and edited from the row context menu via
+  **Background...** with live preview. Do not add a second config file for it. Solid and blur are the same
+  composition tree with and without the blurred layer; a translucent card **must** stay a composition layer rather
+  than a painted fill, because GDI does not write alpha and a translucent fill drags the card's text opacity down
+  with it.
 - Cards sit on a live Gaussian-blurred backdrop supplied by Windows Composition (`src/blur.cpp`). The window is
   `WS_EX_NOREDIRECTIONBITMAP` with a desktop window target; the DIB is uploaded to a composition surface above two
   masked sprite visuals per card. If composition fails to initialize the window is created `WS_EX_LAYERED` instead

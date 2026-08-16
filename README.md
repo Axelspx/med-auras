@@ -164,6 +164,7 @@ The normal path should not show a modal confirmation. Editing and uncommon actio
 - optionally lock position
 - optionally always-on-top
 - system tray show/hide
+- background colour, opacity, and solid/blur
 - settings
 - exit
 
@@ -199,9 +200,15 @@ Suggested data shape:
       "last_taken_at": "2026-08-13T10:30:00",
       "enabled": true
     }
-  ]
+  ],
+  "settings": {
+    "background_blur": true,
+    "background_color": { "r": 0, "g": 0, "b": 0, "a": 99 }
+  }
 }
 ```
+
+Settings keys that are absent take their defaults, so files written by earlier versions load unchanged.
 
 Timestamps are stored as UTC. The editor displays and accepts local Windows date/time values.
 
@@ -219,6 +226,7 @@ The current build includes:
 - widget dragging with restorable on-screen position
 - persistent position locking and always-on-top controls
 - optional local medication icons with native image selection and placeholder fallback
+- configurable card background: solid or blur, with colour and opacity, previewed live
 - per-monitor DPI-aware layout, explicit cooldown state labels, local timestamps, and keyboard navigation
 
 MedAuras MVP is complete. The automated, resource-usage, restart/sleep, and full manual acceptance gates passed on 2026-08-13.
@@ -229,12 +237,16 @@ The widget is a single borderless window whose frame is rendered into a premulti
 the authoritative per-pixel alpha and the rounded card corners and the gaps between rows are smoothly anti-aliased
 against the desktop. There is no window region and no DWM system backdrop.
 
-Each card shows a live, Gaussian-blurred view of whatever is behind the widget, darkened by a neutral tint and clipped
-to the card's rounded shape. That comes from Windows Composition: a backdrop brush feeds a blur effect, and two masked
-sprite visuals per card sit beneath the frame, which is uploaded to a composition surface rather than published with
-`UpdateLayeredWindow`. Nothing captures the screen and the compositor keeps the blur current without the app
-repainting. If composition is unavailable the window falls back to `WS_EX_LAYERED`/`UpdateLayeredWindow` with the
-original opaque card gradient. Blur strength and tint opacity are design tokens (`blur_amount`, `blur_tint_opacity`).
+Each card's background is configurable: **solid** or **blurred**, with an RGBA colour. Blurred shows a live,
+Gaussian-blurred view of whatever is behind the widget, tinted by that colour; solid shows the colour alone. In both
+cases the alpha is real translucency and the card's text, icons, and progress bar stay fully opaque above it. Set it
+from the row context menu → **Background...**, which previews live, or by editing `background_blur` and
+`background_color` in the JSON. Cards are clipped to their rounded shape either way. That comes from Windows Composition: a backdrop brush feeds a blur effect, and masked sprite
+visuals per card sit beneath the frame, which is uploaded to a composition surface rather than published with
+`UpdateLayeredWindow`. Solid mode is the same tree without the blurred layer. Nothing captures the screen and the
+compositor keeps the blur current without the app repainting. If composition is unavailable the window falls back to
+`WS_EX_LAYERED`/`UpdateLayeredWindow` with the original opaque card gradient, and **Background...** is disabled since
+there is no translucency to configure. Blur strength stays a design token (`blur_amount`).
 
 Cards are 364 × 66 DIP and use a flat neutral grey ramp with hairline borders at roughly 12% white. Text steps
 primary, secondary, muted; `SOON`, `DUE`, and `PAUSED` keep chromatic accents so state is never signalled by grey
@@ -319,7 +331,7 @@ Before release, manually verify this daily-use path on Windows 11:
    because of the Direct3D/composition device; what matters is that it is stable, not small.
 6. Drag the widget across other windows and over a high-contrast wallpaper and confirm the card interiors track what
    is behind them, that the gaps between cards stay fully transparent, and that text, icons, and the progress bar
-   stay sharp.
+   stay sharp. Repeat in solid mode and at a low opacity, where text must stay fully opaque over a translucent card.
 7. Confirm clicks pass through the row gaps and the rounded outer corners to whatever is beneath, and that the
    **Taken** button and the icon tile still respond. `WM_NCHITTEST` should answer `HTCLIENT` only inside a card.
 8. Launch `build\Release\med-auras.exe` with CLion off `PATH` to confirm the shipped binary has no toolchain-local

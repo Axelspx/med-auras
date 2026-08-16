@@ -342,6 +342,27 @@ int setting_integer(const JsonValue::Object& object, const char* name) {
     return static_cast<int>(value);
 }
 
+// Background settings arrived after the first released file format, so a missing key is normal and
+// takes the default rather than failing the load.
+bool optional_setting_bool(
+    const JsonValue::Object& object, const char* name, const bool fallback) {
+    const auto found = object.find(name);
+    if (found == object.end()) return fallback;
+    return as<bool>(found->second, name);
+}
+
+unsigned char optional_setting_channel(
+    const JsonValue::Object& object, const char* name, const unsigned char fallback) {
+    const auto found = object.find(name);
+    if (found == object.end()) return fallback;
+    const std::int64_t value = as<std::int64_t>(found->second, name);
+    if (value < 0 || value > 255) {
+        throw std::runtime_error(
+            std::string{"Medication JSON setting '"} + name + "' must be between 0 and 255");
+    }
+    return static_cast<unsigned char>(value);
+}
+
 std::optional<int> optional_setting_integer(const JsonValue::Object& object, const char* name) {
     const JsonValue& value = required(object, name);
     if (std::holds_alternative<std::nullptr_t>(value.value)) return std::nullopt;
@@ -367,6 +388,19 @@ std::vector<Medication> load_medications(const std::filesystem::path& path, Widg
             settings->window_y = optional_setting_integer(object, "window_y");
             settings->position_locked = as<bool>(required(object, "position_locked"), "position_locked");
             settings->always_on_top = as<bool>(required(object, "always_on_top"), "always_on_top");
+            settings->background_blur =
+                optional_setting_bool(object, "background_blur", settings->background_blur);
+            if (const auto colour = object.find("background_color"); colour != object.end()) {
+                const auto& channels = as<JsonValue::Object>(colour->second, "background_color");
+                settings->background_red =
+                    optional_setting_channel(channels, "r", settings->background_red);
+                settings->background_green =
+                    optional_setting_channel(channels, "g", settings->background_green);
+                settings->background_blue =
+                    optional_setting_channel(channels, "b", settings->background_blue);
+                settings->background_alpha =
+                    optional_setting_channel(channels, "a", settings->background_alpha);
+            }
         }
     }
     const auto& values = as<JsonValue::Array>(required(root, "medications"), "medications");
@@ -409,7 +443,12 @@ void save_medications(
     if (settings.window_y) output << *settings.window_y;
     else output << "null";
     output << ",\n    \"position_locked\": " << (settings.position_locked ? "true" : "false") << ",\n"
-           << "    \"always_on_top\": " << (settings.always_on_top ? "true" : "false") << "\n"
+           << "    \"always_on_top\": " << (settings.always_on_top ? "true" : "false") << ",\n"
+           << "    \"background_blur\": " << (settings.background_blur ? "true" : "false") << ",\n"
+           << "    \"background_color\": { \"r\": " << static_cast<int>(settings.background_red)
+           << ", \"g\": " << static_cast<int>(settings.background_green)
+           << ", \"b\": " << static_cast<int>(settings.background_blue)
+           << ", \"a\": " << static_cast<int>(settings.background_alpha) << " }\n"
            << "  }\n}\n";
     output.flush();
     if (!output) {
