@@ -1,5 +1,11 @@
 cmake_minimum_required(VERSION 3.24)
-project(med_auras LANGUAGES CXX RC)
+project(med_auras VERSION 0.2.0 LANGUAGES CXX RC)
+
+# Pre-release suffix, empty for a release build. Shown in the exe's file
+# properties alongside the numeric version.
+set(MED_AURAS_VERSION_SUFFIX "-dev")
+set(MED_AURAS_VERSION_STRING "${PROJECT_VERSION}${MED_AURAS_VERSION_SUFFIX}")
+configure_file(src/version.h.in "${CMAKE_CURRENT_BINARY_DIR}/version.h" @ONLY)
 
 add_executable(med-auras WIN32
     src/main.cpp
@@ -11,6 +17,7 @@ add_executable(med-auras WIN32
 )
 target_compile_features(med-auras PRIVATE cxx_std_20)
 target_compile_definitions(med-auras PRIVATE UNICODE _UNICODE NOMINMAX)
+target_include_directories(med-auras PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
 target_link_libraries(med-auras PRIVATE Advapi32 Comctl32 Shell32 Ole32 Comdlg32 Windowscodecs Msimg32 D2d1 D3d11 Dxgi Dxguid)
 
 if(MSVC)

@@ -123,6 +123,7 @@ constexpr UINT add_medication_command = 4;
 constexpr UINT lock_position_command = 5;
 constexpr UINT always_on_top_command = 6;
 constexpr UINT background_command = 7;
+constexpr UINT history_command = 8;
 constexpr UINT tray_show_hide_command = 10;
 constexpr UINT tray_startup_command = 11;
 constexpr UINT tray_exit_command = 12;
@@ -208,23 +209,39 @@ UINT window_dpi(const HWND window) {
     return get_dpi ? get_dpi(window) : system_dpi();
 }
 
+// A renamed copy of the executable reads and writes its own file, so a test build cannot touch real
+// medication state. `med-auras.exe` keeps `medications.json`; `med-auras-ss.exe` gets
+// `medications-med-auras-ss.json`.
+std::wstring medications_file_name() {
+    std::array<wchar_t, 32'768> executable{};
+    const DWORD length = GetModuleFileName(nullptr, executable.data(), static_cast<DWORD>(executable.size()));
+    if (length == 0 || length == executable.size()) return L"medications.json";
+    const std::wstring stem = std::filesystem::path{std::wstring{executable.data(), length}}.stem().wstring();
+    return stem == L"med-auras" || stem.empty() ? L"medications.json" : L"medications-" + stem + L".json";
+}
+
 std::filesystem::path local_medications_path() {
     PWSTR local_app_data{};
     if (FAILED(SHGetKnownFolderPath(FOLDERID_LocalAppData, KF_FLAG_CREATE, nullptr, &local_app_data))) {
         throw std::runtime_error("Could not locate the local application data folder");
     }
-    const std::filesystem::path path = std::filesystem::path{local_app_data} / L"MedAuras" / L"medications.json";
+    const std::filesystem::path path =
+        std::filesystem::path{local_app_data} / L"MedAuras" / medications_file_name();
     CoTaskMemFree(local_app_data);
     return path;
 }
 
 Medication example_medication() {
-    return Medication{
+    Medication example{
         .id = L"example-medication",
         .name = L"Example medication",
         .dose = L"40 mg",
+        .schedule_type = ScheduleType::hourly,
         .interval = std::chrono::hours{12},
+        .anchor_at = std::chrono::system_clock::now(),
     };
+    example.reset_active_occurrence(example.anchor_at);
+    return example;
 }
 
 int widget_height() {
@@ -235,6 +252,9 @@ int widget_height() {
 
 void enable_startup_if_needed(const HWND window) {
     if (!enable_startup_after_save || medications.empty()) return;
+    // Only the real widget claims a sign-in launch on its own. A renamed test build still has the
+    // tray toggle if you deliberately want one.
+    if (medications_file_name() != L"medications.json") return;
     if (enable_startup()) {
         enable_startup_after_save = false;
     } else {
@@ -242,41 +262,6 @@ void enable_startup_if_needed(const HWND window) {
             window, L"The medication state was saved, but Windows startup could not be enabled.",
             L"Medication Cooldown Widget", MB_OK | MB_ICONWARNING);
     }
-}
-
-std::chrono::system_clock::time_point system_time_to_time_point(const SYSTEMTIME& value) {
-    const std::chrono::year_month_day date{
-        std::chrono::year{value.wYear}, std::chrono::month{value.wMonth}, std::chrono::day{value.wDay}};
-    return std::chrono::sys_days{date} + std::chrono::hours{value.wHour} + std::chrono::minutes{value.wMinute} +
-           std::chrono::seconds{value.wSecond};
-}
-
-SYSTEMTIME time_point_to_system_time(const std::chrono::system_clock::time_point value) {
-    const auto seconds = std::chrono::floor<std::chrono::seconds>(value);
-    const auto day = std::chrono::floor<std::chrono::days>(seconds);
-    const std::chrono::year_month_day date{day};
-    const std::chrono::hh_mm_ss time{seconds - day};
-    return SYSTEMTIME{
-        .wYear = static_cast<WORD>(static_cast<int>(date.year())),
-        .wMonth = static_cast<WORD>(static_cast<unsigned>(date.month())),
-        .wDayOfWeek = static_cast<WORD>(std::chrono::weekday{day}.c_encoding()),
-        .wDay = static_cast<WORD>(static_cast<unsigned>(date.day())),
-        .wHour = static_cast<WORD>(time.hours().count()),
-        .wMinute = static_cast<WORD>(time.minutes().count()),
-        .wSecond = static_cast<WORD>(time.seconds().count()),
-    };
-}
-
-SYSTEMTIME local_time_for(const std::chrono::system_clock::time_point value) {
-    const SYSTEMTIME utc = time_point_to_system_time(value);
-    SYSTEMTIME local{};
-    return SystemTimeToTzSpecificLocalTime(nullptr, &utc, &local) ? local : utc;
-}
-
-std::optional<std::chrono::system_clock::time_point> utc_time_for(const SYSTEMTIME& local) {
-    SYSTEMTIME utc{};
-    if (!TzSpecificLocalTimeToSystemTime(nullptr, &local, &utc)) return std::nullopt;
-    return system_time_to_time_point(utc);
 }
 
 struct DisplayInterval {
@@ -304,6 +289,100 @@ std::wstring interval_text(const double value) {
     return output.str();
 }
 
+std::wstring format_local_time(const SYSTEMTIME& value) {
+    std::array<wchar_t, 32> text{};
+    if (!GetTimeFormatEx(
+            LOCALE_NAME_USER_DEFAULT, TIME_NOSECONDS, &value, nullptr, text.data(),
+            static_cast<int>(text.size()))) {
+        return {};
+    }
+    return text.data();
+}
+
+// GetTimeFormatEx validates the whole structure, so the date has to be a real one even though only
+// the time is used.
+SYSTEMTIME minute_of_day(const int minute) {
+    return SYSTEMTIME{
+        .wYear = 2026, .wMonth = 1, .wDay = 1,
+        .wHour = static_cast<WORD>(minute / 60), .wMinute = static_cast<WORD>(minute % 60)};
+}
+
+// Any Sunday plus the weekday offset, formatted long, so the names follow the user's locale.
+std::wstring weekday_name(const int weekday) {
+    const SYSTEMTIME day = time_point_to_system_time(
+        std::chrono::sys_days{std::chrono::year{2026} / 8 / 16} + std::chrono::days{weekday});
+    std::array<wchar_t, 64> text{};
+    if (!GetDateFormatEx(
+            LOCALE_NAME_USER_DEFAULT, 0, &day, L"dddd", text.data(), static_cast<int>(text.size()), nullptr)) {
+        return {};
+    }
+    return text.data();
+}
+
+std::wstring entry_label(const ScheduleType type, const ScheduleEntry& entry) {
+    const std::wstring time = format_local_time(minute_of_day(entry.minute));
+    if (type == ScheduleType::weekly) return weekday_name(entry.day) + L"\t" + time;
+    if (type == ScheduleType::monthly) return L"Day " + std::to_wstring(entry.day) + L"\t" + time;
+    return time;
+}
+
+ScheduleType selected_schedule_type(const HWND dialog) {
+    const LRESULT selected = SendDlgItemMessage(dialog, IDC_SCHEDULE_TYPE, CB_GETCURSEL, 0, 0);
+    return selected >= 0 && selected <= static_cast<LRESULT>(ScheduleType::monthly)
+               ? static_cast<ScheduleType>(selected)
+               : ScheduleType::hourly;
+}
+
+void refresh_entry_list(const HWND dialog, const Medication& medication) {
+    const HWND list = GetDlgItem(dialog, IDC_ENTRY_LIST);
+    SendMessage(list, LB_RESETCONTENT, 0, 0);
+    for (const ScheduleEntry& entry : medication.entries) {
+        SendMessage(
+            list, LB_ADDSTRING, 0,
+            reinterpret_cast<LPARAM>(entry_label(medication.schedule_type, entry).c_str()));
+    }
+}
+
+void populate_day_combo(const HWND dialog, const ScheduleType type) {
+    const HWND combo = GetDlgItem(dialog, IDC_ENTRY_DAY);
+    SendMessage(combo, CB_RESETCONTENT, 0, 0);
+    if (type == ScheduleType::weekly) {
+        for (int day = 0; day < 7; ++day) {
+            SendMessage(combo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(weekday_name(day).c_str()));
+        }
+    } else if (type == ScheduleType::monthly) {
+        for (int day = 1; day <= 31; ++day) {
+            SendMessage(
+                combo, CB_ADDSTRING, 0,
+                reinterpret_cast<LPARAM>((L"Day " + std::to_wstring(day)).c_str()));
+        }
+    }
+    SendMessage(combo, CB_SETCURSEL, 0, 0);
+}
+
+// The two schedule shapes share the dialog: hidden controls are skipped by tab navigation, so only
+// the relevant one is reachable.
+void show_schedule_controls(const HWND dialog, const ScheduleType type) {
+    const bool hourly = type == ScheduleType::hourly;
+    for (const int id : {IDC_HOURLY_EVERY_LABEL, IDC_MEDICATION_INTERVAL, IDC_MEDICATION_UNIT,
+                         IDC_HOURLY_START_LABEL, IDC_MEDICATION_DATE, IDC_MEDICATION_TIME}) {
+        ShowWindow(GetDlgItem(dialog, id), hourly ? SW_SHOW : SW_HIDE);
+    }
+    for (const int id : {IDC_ENTRY_LABEL, IDC_ENTRY_TIME, IDC_ADD_ENTRY, IDC_ENTRY_LIST, IDC_REMOVE_ENTRY}) {
+        ShowWindow(GetDlgItem(dialog, id), hourly ? SW_HIDE : SW_SHOW);
+    }
+    ShowWindow(GetDlgItem(dialog, IDC_ENTRY_DAY), type == ScheduleType::daily || hourly ? SW_HIDE : SW_SHOW);
+    SetDlgItemText(
+        dialog, IDC_SCHEDULE_HINT,
+        hourly ? L"Repeats every interval from the start time."
+               : L"Fixed times. Taking a dose early or late does not move them.");
+}
+
+void sort_entries(std::vector<ScheduleEntry>& entries) {
+    std::ranges::sort(entries, {}, [](const ScheduleEntry& entry) { return std::pair{entry.day, entry.minute}; });
+    entries.erase(std::ranges::unique(entries).begin(), entries.end());
+}
+
 INT_PTR CALLBACK medication_editor_procedure(
     const HWND dialog, const UINT message, const WPARAM w_param, const LPARAM l_param) {
     if (message == WM_INITDIALOG) {
@@ -321,16 +400,77 @@ INT_PTR CALLBACK medication_editor_procedure(
         }
         SendMessage(unit, CB_SETCURSEL, static_cast<WPARAM>(displayed.unit), 0);
 
+        const HWND type = GetDlgItem(dialog, IDC_SCHEDULE_TYPE);
+        for (const wchar_t* label : {L"Hourly", L"Daily", L"Weekly", L"Monthly"}) {
+            SendMessage(type, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(label));
+        }
+        SendMessage(type, CB_SETCURSEL, static_cast<WPARAM>(medication->schedule_type), 0);
+
         const SYSTEMTIME start = local_time_for(
-            medication->last_taken_at.value_or(std::chrono::system_clock::now()));
+            medication->anchor_at == std::chrono::system_clock::time_point{}
+                ? std::chrono::system_clock::now()
+                : medication->anchor_at);
         DateTime_SetSystemtime(GetDlgItem(dialog, IDC_MEDICATION_DATE), GDT_VALID, &start);
         DateTime_SetSystemtime(GetDlgItem(dialog, IDC_MEDICATION_TIME), GDT_VALID, &start);
+        const SYSTEMTIME default_entry_time = minute_of_day(8 * 60);
+        DateTime_SetSystemtime(GetDlgItem(dialog, IDC_ENTRY_TIME), GDT_VALID, &default_entry_time);
+        constexpr int entry_tab_stop = 80;
+        SendDlgItemMessage(dialog, IDC_ENTRY_LIST, LB_SETTABSTOPS, 1, reinterpret_cast<LPARAM>(&entry_tab_stop));
+        populate_day_combo(dialog, medication->schedule_type);
+        show_schedule_controls(dialog, medication->schedule_type);
+        refresh_entry_list(dialog, *medication);
         SetFocus(GetDlgItem(dialog, IDC_MEDICATION_NAME));
         return FALSE;
     }
     if (message != WM_COMMAND) return FALSE;
     if (LOWORD(w_param) == IDCANCEL) {
         EndDialog(dialog, IDCANCEL);
+        return TRUE;
+    }
+
+    auto* editing = reinterpret_cast<Medication*>(GetWindowLongPtr(dialog, GWLP_USERDATA));
+    if (LOWORD(w_param) == IDC_SCHEDULE_TYPE && HIWORD(w_param) == CBN_SELCHANGE) {
+        editing->schedule_type = selected_schedule_type(dialog);
+        // Times survive a switch between the list types; the day part is clamped into whatever the
+        // new type means by it, which can collapse two entries into one.
+        for (ScheduleEntry& entry : editing->entries) {
+            entry.day = editing->schedule_type == ScheduleType::weekly    ? std::clamp(entry.day, 0, 6)
+                        : editing->schedule_type == ScheduleType::monthly ? std::clamp(entry.day, 1, 31)
+                                                                          : 0;
+        }
+        sort_entries(editing->entries);
+        // A medication that has never had an hourly interval would otherwise offer "every 0 minutes".
+        if (editing->schedule_type == ScheduleType::hourly && editing->interval <= std::chrono::minutes::zero()) {
+            editing->interval = std::chrono::hours{12};
+            const DisplayInterval displayed = display_interval(editing->interval);
+            SetDlgItemText(dialog, IDC_MEDICATION_INTERVAL, interval_text(displayed.value).c_str());
+            SendDlgItemMessage(dialog, IDC_MEDICATION_UNIT, CB_SETCURSEL, static_cast<WPARAM>(displayed.unit), 0);
+        }
+        populate_day_combo(dialog, editing->schedule_type);
+        show_schedule_controls(dialog, editing->schedule_type);
+        refresh_entry_list(dialog, *editing);
+        return TRUE;
+    }
+    if (LOWORD(w_param) == IDC_ADD_ENTRY) {
+        SYSTEMTIME time{};
+        DateTime_GetSystemtime(GetDlgItem(dialog, IDC_ENTRY_TIME), &time);
+        const LRESULT day = SendDlgItemMessage(dialog, IDC_ENTRY_DAY, CB_GETCURSEL, 0, 0);
+        ScheduleEntry entry{.minute = time.wHour * 60 + time.wMinute};
+        if (editing->schedule_type == ScheduleType::weekly) entry.day = static_cast<int>(std::max<LRESULT>(day, 0));
+        if (editing->schedule_type == ScheduleType::monthly) {
+            entry.day = static_cast<int>(std::max<LRESULT>(day, 0)) + 1;
+        }
+        editing->entries.push_back(entry);
+        sort_entries(editing->entries);
+        refresh_entry_list(dialog, *editing);
+        return TRUE;
+    }
+    if (LOWORD(w_param) == IDC_REMOVE_ENTRY) {
+        const LRESULT selected = SendDlgItemMessage(dialog, IDC_ENTRY_LIST, LB_GETCURSEL, 0, 0);
+        if (selected >= 0 && static_cast<std::size_t>(selected) < editing->entries.size()) {
+            editing->entries.erase(editing->entries.begin() + static_cast<std::ptrdiff_t>(selected));
+            refresh_entry_list(dialog, *editing);
+        }
         return TRUE;
     }
     if (LOWORD(w_param) == IDC_BROWSE_ICON) {
@@ -351,46 +491,110 @@ INT_PTR CALLBACK medication_editor_procedure(
     }
     if (LOWORD(w_param) != IDOK) return FALSE;
 
-    auto* medication = reinterpret_cast<Medication*>(GetWindowLongPtr(dialog, GWLP_USERDATA));
     std::array<wchar_t, 256> name{};
     std::array<wchar_t, 128> dose{};
-    std::array<wchar_t, 32> interval_text{};
     std::array<wchar_t, 32'768> icon_path{};
     GetDlgItemText(dialog, IDC_MEDICATION_NAME, name.data(), static_cast<int>(name.size()));
     GetDlgItemText(dialog, IDC_MEDICATION_DOSE, dose.data(), static_cast<int>(dose.size()));
-    GetDlgItemText(
-        dialog, IDC_MEDICATION_INTERVAL, interval_text.data(), static_cast<int>(interval_text.size()));
     GetDlgItemText(dialog, IDC_MEDICATION_ICON, icon_path.data(), static_cast<int>(icon_path.size()));
-
-    wchar_t* interval_end{};
-    const double interval_value = std::wcstod(interval_text.data(), &interval_end);
-    const LRESULT selected_unit = SendDlgItemMessage(dialog, IDC_MEDICATION_UNIT, CB_GETCURSEL, 0, 0);
-    const auto interval = selected_unit >= 0 && selected_unit <= static_cast<LRESULT>(IntervalUnit::weeks)
-                              ? interval_in_minutes(interval_value, static_cast<IntervalUnit>(selected_unit))
-                              : std::nullopt;
-    SYSTEMTIME date{};
-    SYSTEMTIME time{};
-    DateTime_GetSystemtime(GetDlgItem(dialog, IDC_MEDICATION_DATE), &date);
-    DateTime_GetSystemtime(GetDlgItem(dialog, IDC_MEDICATION_TIME), &time);
-    date.wHour = time.wHour;
-    date.wMinute = time.wMinute;
-    date.wSecond = 0;
-    date.wMilliseconds = 0;
-    const auto start = utc_time_for(date);
-    if (name[0] == L'\0' || !interval || !start || interval_end == interval_text.data() || *interval_end != L'\0') {
-        MessageBox(
-            dialog, L"Enter a medication name, positive interval, unit, and valid start date/time.", L"Medication",
-            MB_OK | MB_ICONWARNING);
+    if (name[0] == L'\0') {
+        MessageBox(dialog, L"Enter a medication name.", L"Medication", MB_OK | MB_ICONWARNING);
         return TRUE;
     }
 
-    medication->name = name.data();
-    medication->dose = dose.data();
-    medication->icon_path = icon_path[0] == L'\0' ? std::nullopt : std::optional<std::wstring>{icon_path.data()};
-    medication->interval = *interval;
-    medication->last_taken_at = *start;
+    if (editing->schedule_type == ScheduleType::hourly) {
+        std::array<wchar_t, 32> interval_entry{};
+        GetDlgItemText(
+            dialog, IDC_MEDICATION_INTERVAL, interval_entry.data(), static_cast<int>(interval_entry.size()));
+        wchar_t* interval_end{};
+        const double interval_value = std::wcstod(interval_entry.data(), &interval_end);
+        const LRESULT selected_unit = SendDlgItemMessage(dialog, IDC_MEDICATION_UNIT, CB_GETCURSEL, 0, 0);
+        const auto interval = selected_unit >= 0 && selected_unit <= static_cast<LRESULT>(IntervalUnit::weeks)
+                                  ? interval_in_minutes(interval_value, static_cast<IntervalUnit>(selected_unit))
+                                  : std::nullopt;
+        SYSTEMTIME date{};
+        SYSTEMTIME time{};
+        DateTime_GetSystemtime(GetDlgItem(dialog, IDC_MEDICATION_DATE), &date);
+        DateTime_GetSystemtime(GetDlgItem(dialog, IDC_MEDICATION_TIME), &time);
+        date.wHour = time.wHour;
+        date.wMinute = time.wMinute;
+        date.wSecond = 0;
+        date.wMilliseconds = 0;
+        const auto start = utc_time_for(date);
+        if (!interval || !start || interval_end == interval_entry.data() || *interval_end != L'\0') {
+            MessageBox(
+                dialog, L"Enter a positive interval, unit, and valid start date/time.", L"Medication",
+                MB_OK | MB_ICONWARNING);
+            return TRUE;
+        }
+        editing->interval = *interval;
+        editing->anchor_at = *start;
+        editing->entries.clear();
+    } else if (editing->entries.empty()) {
+        MessageBox(dialog, L"Add at least one scheduled time.", L"Medication", MB_OK | MB_ICONWARNING);
+        return TRUE;
+    }
+
+    editing->name = name.data();
+    editing->dose = dose.data();
+    editing->icon_path = icon_path[0] == L'\0' ? std::nullopt : std::optional<std::wstring>{icon_path.data()};
     EndDialog(dialog, IDOK);
     return TRUE;
+}
+
+bool same_schedule(const Medication& left, const Medication& right) {
+    return left.schedule_type == right.schedule_type && left.interval == right.interval &&
+           left.anchor_at == right.anchor_at && left.entries == right.entries;
+}
+
+std::wstring history_line(const DoseRecord& record) {
+    const SYSTEMTIME scheduled = local_time_for(record.scheduled_at);
+    std::array<wchar_t, 32> date{};
+    if (!GetDateFormatEx(
+            LOCALE_NAME_USER_DEFAULT, 0, &scheduled, L"ddd dd MMM", date.data(),
+            static_cast<int>(date.size()), nullptr)) {
+        return {};
+    }
+    const std::wstring when = std::wstring{date.data()} + L" " + format_local_time(scheduled) + L"\t";
+    switch (record.status) {
+    case DoseStatus::taken:
+        return record.taken_at ? when + L"taken " + format_local_time(local_time_for(*record.taken_at))
+                               : when + L"taken";
+    case DoseStatus::missed: return when + L"missed";
+    case DoseStatus::paused: return when + L"paused";
+    case DoseStatus::resumed: return when + L"resumed";
+    }
+    return when;
+}
+
+INT_PTR CALLBACK history_procedure(
+    const HWND dialog, const UINT message, const WPARAM w_param, const LPARAM l_param) {
+    if (message == WM_INITDIALOG) {
+        const auto* medication = reinterpret_cast<const Medication*>(l_param);
+        SetWindowText(dialog, (medication->name + L" - history").c_str());
+        const HWND list = GetDlgItem(dialog, IDC_HISTORY_LIST);
+        constexpr int tab_stop = 104;
+        SendMessage(list, LB_SETTABSTOPS, 1, reinterpret_cast<LPARAM>(&tab_stop));
+        // Newest first: what happened today is the reason anyone opens this.
+        for (auto record = medication->history.rbegin(); record != medication->history.rend(); ++record) {
+            SendMessage(list, LB_ADDSTRING, 0, reinterpret_cast<LPARAM>(history_line(*record).c_str()));
+        }
+        if (medication->history.empty()) {
+            SendMessage(list, LB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"No doses recorded yet."));
+        }
+        return TRUE;
+    }
+    if (message == WM_COMMAND && (LOWORD(w_param) == IDOK || LOWORD(w_param) == IDCANCEL)) {
+        EndDialog(dialog, IDOK);
+        return TRUE;
+    }
+    return FALSE;
+}
+
+void show_history(const HWND window, const Medication& medication) {
+    DialogBoxParam(
+        GetModuleHandle(nullptr), MAKEINTRESOURCE(IDD_HISTORY), window, history_procedure,
+        reinterpret_cast<LPARAM>(&medication));
 }
 
 bool edit_medication(const HWND owner, Medication& medication) {
@@ -544,29 +748,59 @@ std::wstring new_medication_id() {
 
 std::wstring status_text(const Medication& medication, const std::chrono::system_clock::time_point now) {
     if (!medication.enabled) return L"PAUSED";
-    const std::chrono::minutes remaining = medication.remaining_at(now);
-    if (remaining == std::chrono::minutes::zero()) return L"DUE";
+    if (medication.is_overdue_at(now)) return L"OVERDUE";
     return medication.is_soon_at(now) ? L"SOON" : L"";
 }
 
-// Seconds-precision remaining time, derived from the same stored anchor the model uses. This is a
+// Seconds-precision distance to the tracked occurrence, negative once it has gone by. This is a
 // display concern only: nothing seconds-level is ever persisted.
-std::chrono::seconds remaining_seconds(
+std::chrono::seconds seconds_until_due(
     const Medication& medication, const std::chrono::system_clock::time_point now) {
-    const auto next = medication.next_available_at();
-    if (!next || *next <= now) return std::chrono::seconds::zero();
-    return std::chrono::ceil<std::chrono::seconds>(*next - now);
+    return std::chrono::ceil<std::chrono::seconds>(medication.active_at - now);
 }
 
 std::wstring countdown_text(const Medication& medication, const std::chrono::system_clock::time_point now) {
     if (!medication.enabled) return L"PAUSED";
-    if (medication.remaining_at(now) == std::chrono::minutes::zero()) return L"DUE";
-    const std::chrono::seconds remaining = remaining_seconds(medication, now);
-    const auto hours = std::chrono::duration_cast<std::chrono::hours>(remaining);
-    const auto minutes = std::chrono::duration_cast<std::chrono::minutes>(remaining - hours);
-    const auto seconds = remaining - hours - minutes;
-    // Hours unpadded and dropped when zero; below an hour it is always MM:SS. 1:20:00, 20:05, 00:45.
+    const std::chrono::seconds distance = seconds_until_due(medication, now);
     std::array<wchar_t, 32> text{};
+    if (distance <= std::chrono::seconds::zero()) {
+        // Overdue counts up from the occurrence that was missed first. Past an hour it drops
+        // seconds, which is also what lets the repaint slow to once a minute.
+        const std::chrono::seconds overdue = -distance;
+        const auto days = std::chrono::duration_cast<std::chrono::days>(overdue);
+        const auto hours = std::chrono::duration_cast<std::chrono::hours>(overdue - days);
+        const auto minutes = std::chrono::duration_cast<std::chrono::minutes>(overdue - days - hours);
+        if (days.count() > 0) {
+            swprintf(
+                text.data(), text.size(), L"%lldd %lldh overdue", static_cast<long long>(days.count()),
+                static_cast<long long>(hours.count()));
+        } else if (hours.count() > 0) {
+            swprintf(
+                text.data(), text.size(), L"%lldh %lldm overdue", static_cast<long long>(hours.count()),
+                static_cast<long long>(minutes.count()));
+        } else {
+            swprintf(
+                text.data(), text.size(), L"%02lld:%02lld overdue", static_cast<long long>(minutes.count()),
+                static_cast<long long>((overdue - minutes).count()));
+        }
+        return text.data();
+    }
+
+    // A weekly or monthly dose is days out, where seconds are noise and "364:26:20" is unreadable.
+    // Same tiers as the overdue text, and the repaint slows to match.
+    if (distance >= std::chrono::hours{24}) {
+        const auto days = std::chrono::duration_cast<std::chrono::days>(distance);
+        const auto hours = std::chrono::duration_cast<std::chrono::hours>(distance - days);
+        swprintf(
+            text.data(), text.size(), L"%lldd %lldh", static_cast<long long>(days.count()),
+            static_cast<long long>(hours.count()));
+        return text.data();
+    }
+
+    const auto hours = std::chrono::duration_cast<std::chrono::hours>(distance);
+    const auto minutes = std::chrono::duration_cast<std::chrono::minutes>(distance - hours);
+    const auto seconds = distance - hours - minutes;
+    // Hours unpadded and dropped when zero; below an hour it is always MM:SS. 1:20:00, 20:05, 00:45.
     if (hours.count() > 0) {
         swprintf(
             text.data(), text.size(), L"%lld:%02lld:%02lld", static_cast<long long>(hours.count()),
@@ -581,10 +815,7 @@ std::wstring countdown_text(const Medication& medication, const std::chrono::sys
 
 std::wstring local_timestamp_text(
     const Medication& medication, const std::chrono::system_clock::time_point now) {
-    const auto timestamp = medication.next_available_at();
-    if (!timestamp) return countdown_text(medication, now);
-
-    const SYSTEMTIME local = local_time_for(*timestamp);
+    const SYSTEMTIME local = local_time_for(medication.active_at);
     std::array<wchar_t, 32> date{};
     std::array<wchar_t, 32> time{};
     if (!GetDateFormatEx(
@@ -594,9 +825,9 @@ std::wstring local_timestamp_text(
             static_cast<int>(time.size()))) {
         return {};
     }
-    const wchar_t* prefix = !medication.enabled                                      ? L"Was due "
-                            : medication.remaining_at(now) == std::chrono::minutes::zero() ? L"Since "
-                                                                                      : L"";
+    const wchar_t* prefix = !medication.enabled              ? L"Was due "
+                            : medication.is_overdue_at(now) ? L"Due "
+                                                            : L"";
     return std::wstring{prefix} + date.data() + L" " + time.data();
 }
 
@@ -614,13 +845,20 @@ void schedule_refresh(const HWND window) {
     KillTimer(window, refresh_timer);
     if (!IsWindowVisible(window)) return;
     const auto now = std::chrono::system_clock::now();
-    if (std::ranges::any_of(medications, [now](const Medication& medication) {
-            return medication.enabled && medication.remaining_at(now) > std::chrono::minutes::zero();
-        })) {
-        // The countdown shows seconds, so it has to tick every second while a countdown is on
-        // screen. Hidden and all-ready/paused states still schedule nothing at all.
-        SetTimer(window, refresh_timer, 1'000, nullptr);
+    // The finest cadence any visible card actually needs, and no finer. Seconds are on screen from a
+    // day before the dose until an hour after it; outside that the text is whole minutes or whole
+    // hours. Hidden, all-paused, and no-medication states schedule nothing at all.
+    UINT interval = 0;
+    for (const Medication& medication : medications) {
+        if (!medication.enabled) continue;
+        const auto distance = medication.active_at - now;
+        const UINT wanted = distance >= std::chrono::hours{24}   ? 3'600'000u
+                            : distance > -std::chrono::hours{1}  ? 1'000u
+                            : distance > -std::chrono::hours{24} ? 60'000u
+                                                                 : 3'600'000u;
+        interval = interval == 0 ? wanted : std::min(interval, wanted);
     }
+    if (interval != 0) SetTimer(window, refresh_timer, interval, nullptr);
 }
 
 void save_state() {
@@ -1008,11 +1246,14 @@ COLORREF contrasting_text(const COLORREF background) {
 double progress_fraction(
     const Medication& medication, const std::chrono::system_clock::time_point now) {
     if (!medication.enabled) return 1.0;
-    const std::chrono::minutes remaining = medication.remaining_at(now);
-    if (remaining <= std::chrono::minutes::zero() || medication.interval.count() <= 0) return 0.0;
-    return std::clamp(
-        static_cast<double>(remaining.count()) / static_cast<double>(medication.interval.count()),
-        0.0, 1.0);
+    if (now >= medication.active_at) return 0.0;
+    // The bar drains across the gap between the previous scheduled occurrence and the tracked one,
+    // which is the span the schedule actually defines. It is not measured from when a dose was taken.
+    const auto previous = previous_occurrence_before(medication, medication.active_at);
+    if (!previous || *previous >= medication.active_at) return 0.0;
+    const std::chrono::duration<double> span = medication.active_at - *previous;
+    const std::chrono::duration<double> remaining = medication.active_at - now;
+    return std::clamp(remaining / span, 0.0, 1.0);
 }
 
 COLORREF blend_color(const COLORREF from, const COLORREF to, const float amount) {
@@ -1224,13 +1465,13 @@ bool rebuild_widget(const HWND window) {
 
 void mark_medication_taken(const HWND window, const std::size_t index) {
     Medication& medication = medications[index];
-    const auto previous = medication.last_taken_at;
+    const Medication previous = medication;
     medication.mark_taken(std::chrono::system_clock::now());
     try {
         save_state();
         enable_startup_if_needed(window);
     } catch (const std::exception&) {
-        medication.last_taken_at = previous;
+        medication = previous;
         MessageBox(
             window, L"The medication time could not be saved.", L"Medication Cooldown Widget",
             MB_OK | MB_ICONERROR);
@@ -1243,6 +1484,9 @@ void edit_medication_at(const HWND window, const std::size_t index) {
     Medication edited = medications[index];
     if (!edit_medication(window, edited)) return;
     const Medication previous = medications[index];
+    // A new schedule replaces the tracked occurrence outright rather than being patched onto it.
+    // Editing only the name or icon leaves an overdue dose exactly where it was.
+    if (!same_schedule(edited, previous)) edited.reset_active_occurrence(std::chrono::system_clock::now());
     medications[index] = std::move(edited);
     try {
         save_state();
@@ -1289,6 +1533,18 @@ RoundedShape inset_shape(const RoundedShape& shape, const float inset) {
             shape.bounds.right - inset, shape.bounds.bottom - inset),
         std::max(0.0F, shape.radius - inset),
     };
+}
+
+// The fill is the bar's own shape, inset so it sits inside the border rather than under it: the bar
+// is a capsule, so a shorter fill carrying its own smaller radius pokes out through the curved cap.
+// The filled width comes from clipping that shape, not from resizing it.
+RoundedShape progress_fill_shape(const RoundedShape& bar) {
+    return inset_shape(bar, design.stroke);
+}
+
+float progress_fill_edge(const RoundedShape& bar, const double progress) {
+    const D2D1_RECT_F bounds = progress_fill_shape(bar).bounds;
+    return bounds.left + (bounds.right - bounds.left) * static_cast<float>(progress);
 }
 
 D2D1_ROUNDED_RECT native_shape(const RoundedShape& shape) {
@@ -1470,8 +1726,7 @@ void render_redesigned_widget(
             for (std::size_t index = 0; index < medications.size(); ++index) {
                 const Medication& medication = medications[index];
                 const RowLayout layout = row_layout(index);
-                const std::chrono::minutes remaining = medication.remaining_at(now);
-                const bool due = medication.enabled && remaining == std::chrono::minutes::zero();
+                const bool due = medication.is_overdue_at(now);
                 const bool soon = medication.is_soon_at(now);
                 const bool paused = !medication.enabled;
 
@@ -1507,13 +1762,15 @@ void render_redesigned_widget(
                 fill_shape(d2d_render_target, brush, layout.progress_bar, progress_track);
                 const double progress = progress_fraction(medication, now);
                 if (progress > 0.0) {
-                    RoundedShape progress_fill = layout.progress_bar;
-                    progress_fill.bounds.right = progress_fill.bounds.left +
-                        (progress_fill.bounds.right - progress_fill.bounds.left) * static_cast<float>(progress);
-                    progress_fill.radius = std::min(
-                        progress_fill.radius,
-                        (progress_fill.bounds.right - progress_fill.bounds.left) * 0.5F);
-                    fill_shape(d2d_render_target, brush, progress_fill, accent);
+                    d2d_render_target->PushAxisAlignedClip(
+                        rect(
+                            layout.progress_bar.bounds.left, layout.progress_bar.bounds.top,
+                            progress_fill_edge(layout.progress_bar, progress),
+                            layout.progress_bar.bounds.bottom),
+                        D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+                    fill_shape(
+                        d2d_render_target, brush, progress_fill_shape(layout.progress_bar), accent);
+                    d2d_render_target->PopAxisAlignedClip();
                 }
                 stroke_shape(
                     d2d_render_target, brush, layout.progress_bar,
@@ -1550,8 +1807,7 @@ void render_redesigned_widget(
     for (std::size_t index = 0; index < medications.size(); ++index) {
         const Medication& medication = medications[index];
         const RowLayout layout = row_layout(index);
-        const std::chrono::minutes remaining = medication.remaining_at(now);
-        const bool due = medication.enabled && remaining == std::chrono::minutes::zero();
+        const bool due = medication.is_overdue_at(now);
         const bool paused = !medication.enabled;
         const RECT icon_bounds = pixel_rect(layout.icon);
         const int icon_size = pixels(design.icon_size);
@@ -1633,32 +1889,41 @@ void render_redesigned_widget(
         const RECT bar_text = pixel_rect(layout.progress_text);
         const std::wstring text = hovered_bar == index ? local_timestamp_text(medication, now)
                                                        : countdown_text(medication, now);
+        // The occurrence being tracked, shown opposite the countdown so the card says both when the
+        // dose is scheduled and how far off it is. Hovering swaps the countdown for the full date,
+        // which already carries the time, so the short form steps aside.
+        const std::wstring scheduled = hovered_bar == index || !medication.enabled
+                                           ? std::wstring{}
+                                           : format_local_time(local_time_for(medication.active_at));
         SelectObject(device, countdown_font);
         // The countdown can straddle the boundary between the bar fill and the empty track, which
         // are very different luminances. Draw it twice, clipped either side of the fill edge, so
         // each part contrasts the pixels actually beneath it -- including mid-glyph.
         const RECT bar = pixel_rect(layout.progress_bar.bounds);
-        const auto fill_edge = static_cast<LONG>(std::lround(
-            static_cast<double>(bar.left) +
-            static_cast<double>(bar.right - bar.left) * progress_fraction(medication, now)));
+        const auto fill_edge = static_cast<LONG>(
+            pixels(progress_fill_edge(layout.progress_bar, progress_fraction(medication, now))));
         const COLORREF over_fill = contrasting_text(
             paused                       ? progress_paused
             : due                        ? progress_due
             : medication.is_soon_at(now) ? progress_soon
                                          : progress_normal);
         const COLORREF over_track = due ? accent_due_text : contrasting_text(progress_track);
-        const UINT format = DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS;
-        const auto draw_clipped = [&](const LONG left, const LONG right, const COLORREF color) {
-            if (left >= right) return;
+        const auto draw_clipped = [&](const std::wstring& value, const UINT alignment, const LONG left,
+                                      const LONG right, const COLORREF color) {
+            if (left >= right || value.empty()) return;
             const int saved = SaveDC(device);
             IntersectClipRect(device, left, bar.top - 1, right, bar.bottom + 1);
             SetTextColor(device, color);
             RECT clipped = bar_text;
-            DrawText(device, text.c_str(), -1, &clipped, format);
+            DrawText(
+                device, value.c_str(), -1, &clipped,
+                alignment | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
             RestoreDC(device, saved);
         };
-        draw_clipped(bar_text.left, fill_edge, over_fill);
-        draw_clipped(fill_edge, bar_text.right, over_track);
+        draw_clipped(text, DT_RIGHT, bar_text.left, fill_edge, over_fill);
+        draw_clipped(text, DT_RIGHT, fill_edge, bar_text.right, over_track);
+        draw_clipped(scheduled, DT_LEFT, bar_text.left, fill_edge, over_fill);
+        draw_clipped(scheduled, DT_LEFT, fill_edge, bar_text.right, over_track);
 
         const HWND taken_button = GetDlgItem(window, first_taken_button_id + static_cast<int>(index));
         SetTextColor(device, IsWindowEnabled(taken_button) ? text_primary : text_muted);
@@ -1812,6 +2077,7 @@ LRESULT CALLBACK window_procedure(const HWND window, const UINT message, const W
         if (!menu) return 0;
         if (index) {
             AppendMenu(menu, MF_STRING, edit_medication_command, L"Edit...");
+            AppendMenu(menu, MF_STRING, history_command, L"History...");
             AppendMenu(
                 menu, MF_STRING, toggle_paused_command, medications[*index].enabled ? L"Pause" : L"Resume");
             AppendMenu(menu, MF_STRING, remove_medication_command, L"Remove");
@@ -1836,10 +2102,17 @@ LRESULT CALLBACK window_procedure(const HWND window, const UINT message, const W
         DestroyMenu(menu);
         if (command == edit_medication_command && index) {
             edit_medication_at(window, *index);
+        } else if (command == history_command && index) {
+            show_history(window, medications[*index]);
         } else if (command == add_medication_command) {
-            Medication added{.interval = std::chrono::hours{24}};
+            Medication added{
+                .schedule_type = ScheduleType::hourly,
+                .interval = std::chrono::hours{24},
+                .anchor_at = std::chrono::system_clock::now(),
+            };
             if (edit_medication(window, added)) {
                 added.id = new_medication_id();
+                added.reset_active_occurrence(std::chrono::system_clock::now());
                 medications.push_back(std::move(added));
                 try {
                     save_state();
@@ -1855,12 +2128,14 @@ LRESULT CALLBACK window_procedure(const HWND window, const UINT message, const W
             }
         } else if (command == toggle_paused_command && index) {
             Medication& medication = medications[*index];
-            medication.enabled = !medication.enabled;
+            const Medication previous = medication;
+            if (medication.enabled) medication.pause();
+            else medication.resume(std::chrono::system_clock::now());
             try {
                 save_state();
                 enable_startup_if_needed(window);
             } catch (const std::exception&) {
-                medication.enabled = !medication.enabled;
+                medication = previous;
                 MessageBox(
                     window, L"The medication state could not be saved.", L"Medication Cooldown Widget",
                     MB_OK | MB_ICONERROR);

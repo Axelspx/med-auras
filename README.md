@@ -18,9 +18,8 @@ Each row should show:
 - Medication name
 - Dose
 - Horizontal cooldown/progress bar
-- Remaining time, or `READY`
+- The scheduled time of the next dose, and the time remaining or how overdue it is
 - One obvious **Taken** button
-- Optional small secondary text such as last-taken or next-dose time
 
 The visual direction should take inspiration from WoW cooldown trackers: compact, readable, stacked bars with strong status visibility. Do not copy WoW assets or reproduce an addon skin exactly.
 
@@ -28,13 +27,13 @@ Example:
 
 ```text
 [icon] Elvanse 40 mg                    [Taken]
-       ██████████████ 13:24:07 ░░░░░░░░
+       ██ 08:30 ███████ 13:24:07 ░░░░░░░
 
 [icon] Ibuprofen 400 mg                 [Taken]
-       █████ 02:11:45 ░░░░░░░░░░░░░░░░░
+       █ 12:30 ░░░░░ 02:11:45 ░░░░░░░░░░
 
 [icon] Vitamin D                        [Taken]
-       ████████████ READY ██████████████
+       ░ 09:00 ░░░░░ 35:12 overdue ░░░░░
 ```
 
 ## Technology
@@ -73,11 +72,11 @@ The application should:
 - keep memory usage small
 - perform no network activity
 
-Timer state must be calculated from timestamps:
+Timer state must be calculated from the schedule, never from when a dose was taken:
 
 ```text
-last_taken_at + interval = next_available_at
-remaining = next_available_at - current_time
+active_at = the earliest scheduled occurrence not yet taken or missed
+remaining = active_at - current_time      (negative means overdue)
 ```
 
 Timers must remain correct through:
@@ -121,23 +120,34 @@ Each medication should support:
 - name
 - dose
 - optional icon
-- interval between doses
-- last-taken timestamp
-- next-available timestamp derived from stored state
+- a fixed recurring schedule
+- the active occurrence it is currently tracking
+- dose history
 - enabled/paused state
 
-When adding or editing a medication, the user chooses a start date/time (defaulting to now), an interval value, and
-minutes, hours, days, or weeks as the unit. Fractional intervals are supported when they resolve to at least one whole
-minute. For example, `3.5 days` becomes `5040` stored minutes. The selected start is the initial timer anchor; clicking
-**Taken** later replaces it with the actual click time.
+Schedules are fixed and do not drift when a dose is recorded:
+
+- **Hourly** — every N hours from a chosen start date/time, repeating continuously rather than restarting each day.
+- **Daily** — one or more fixed times every day.
+- **Weekly** — one or more weekday and time pairs.
+- **Monthly** — one or more day-of-month and time pairs, skipping months that do not have the day.
+
+Hourly accepts a value in minutes, hours, days, or weeks, fractional as long as it resolves to at least one whole
+minute; `3.5 days` becomes `5040` stored minutes. The other types are edited as a list of times built with **Add**
+and **Remove**.
+
+A medication tracks exactly one occurrence at a time. Clicking **Taken** records the dose that is due at that moment,
+marks any earlier unresolved doses as missed, and moves to the next scheduled occurrence — taking a dose early or
+late never moves it. An occurrence whose time has passed stays active and is shown as overdue, measured from the
+first dose missed, and the app never skips or advances it on its own.
 
 ### Cooldown bars
 
 Each medication row should:
 
-- visually represent time remaining
-- show a concise countdown
-- switch to a clear `READY` state when available
+- visually represent time remaining until the scheduled dose
+- show the scheduled time and a concise countdown
+- switch to a clear `OVERDUE` state once that time has passed
 - support urgency/status styling
 - be compact enough for several medications to stack vertically
 
@@ -147,10 +157,11 @@ Each medication row should have one obvious **Taken** button.
 
 Clicking it should immediately:
 
-1. record the current time as `last_taken_at`
-2. derive the new next-available time
-3. persist the updated state
-4. restart/redraw the cooldown bar
+1. record the occurrence that is due as taken, with the actual click time
+2. record any earlier unresolved occurrences as missed
+3. advance to the next scheduled occurrence
+4. persist the updated state
+5. redraw the row against the new occurrence
 
 The normal path should not show a modal confirmation. Editing and uncommon actions should stay separate from this primary action.
 
@@ -158,6 +169,7 @@ The normal path should not show a modal confirmation. Editing and uncommon actio
 
 - right-click medication row: context menu
 - edit medication
+- view dose history
 - pause/resume medication
 - remove medication
 - drag widget
@@ -196,9 +208,13 @@ Suggested data shape:
     {
       "name": "Medication",
       "dose": "40 mg",
-      "interval_minutes": 1440,
-      "last_taken_at": "2026-08-13T10:30:00",
-      "enabled": true
+      "enabled": true,
+      "schedule_type": "daily",
+      "entries": [{ "day": 0, "minute": 510 }, { "day": 0, "minute": 750 }],
+      "active_at": "2026-08-16T10:30:00Z",
+      "history": [
+        { "scheduled_at": "2026-08-16T06:30:00Z", "taken_at": "2026-08-16T06:41:00Z", "status": "taken" }
+      ]
     }
   ],
   "settings": {
@@ -208,18 +224,28 @@ Suggested data shape:
 }
 ```
 
-Settings keys that are absent take their defaults, so files written by earlier versions load unchanged.
+An hourly medication carries `interval_minutes` and `anchor_at` instead of `entries`. `minute` is minutes since local
+midnight; `day` is a weekday (0 = Sunday) for weekly schedules and a day of the month for monthly ones. History
+statuses are `taken`, `missed`, `paused`, and `resumed`, capped at the most recent 500 records per medication.
 
-Timestamps are stored as UTC. The editor displays and accepts local Windows date/time values.
+Files written before the schedule system carried `interval_minutes` and `last_taken_at`. They load as an hourly
+schedule with the same interval anchored at the last dose, and the dose that was pending stays pending — overdue if
+its time has already gone by. Nothing about an existing interval is rounded or altered. Settings keys that are absent
+take their defaults, so older files load unchanged.
+
+Timestamps are stored as UTC. The editor displays and accepts local Windows date/time values, and schedule entries
+are local wall-clock times, so a fixed time stays fixed across a daylight-saving change.
 
 ## Current Development Build
 
 The current build includes:
 
 - compact stacked cooldown rows
-- `READY`, active countdown, and paused states
-- immediate persistence when **Taken** is clicked
-- add/edit with start date/time and minute/hour/day/week interval units
+- fixed hourly, daily, weekly, and monthly schedules that do not drift when a dose is recorded
+- active countdown, `SOON`, `OVERDUE`, and paused states
+- immediate persistence when **Taken** is clicked, resolving missed doses in the same press
+- per-medication dose history from the row context menu
+- add/edit with a schedule type and either an interval and start or a list of times
 - right-click pause/resume and confirmed removal
 - automatic current-user Windows sign-in startup after initial configuration
 - system-tray show/hide, startup toggle, and exit controls
@@ -256,10 +282,15 @@ and are aligned on a common baseline computed from font metrics, so they stay al
 changes.
 
 Each row has one action control, **Taken**. Editing is reached by clicking the medication's icon tile, which
-crossfades to a pencil glyph on hover; both the tile and the Taken circle show a hand cursor. The countdown reads
-`1:20:00` above an hour and `MM:SS` below it, and is drawn twice against a clip at the progress fill edge so the part
-over the bright fill and the part over the dark track each contrast what is actually beneath them, splitting
-mid-glyph where it crosses.
+crossfades to a pencil glyph on hover; both the tile and the Taken circle show a hand cursor. The progress bar shows
+the scheduled time of the tracked occurrence on the left and the countdown on the right; hovering replaces the
+countdown with the full date and drops the short time. The countdown reads `1:20:00` above an hour and `MM:SS` below
+it, then counts up as `MM:SS overdue`, `2h 14m overdue`, and `3d 4h overdue`. Every run is drawn twice against a clip
+at the progress fill edge so the part over the bright fill and the part over the dark track each contrast what is
+actually beneath them, splitting mid-glyph where it crosses.
+
+The bar drains across the gap between the previous scheduled occurrence and the tracked one, and is empty once
+overdue, where the `OVERDUE` badge, red border, and red countdown carry the state.
 
 Editing has no Tab stop of its own, since the icon tile is painted rather than a control. It remains reachable from
 the keyboard through the row context menu (Shift+F10 or the Menu key) → **Edit...**.
@@ -293,6 +324,20 @@ Replacing the two `target_compile_features(... cxx_std_20)` calls with
 `set_property(TARGET ... PROPERTY CXX_STANDARD 20)` is the known fix; it has not been applied. Until it is, MSVC can
 only be verified by invoking `cl` directly, and MinGW is the only toolchain that configures.
 
+#### Sandbox copies
+
+A copy of the executable under any other name runs against its own state, so a test build cannot disturb real
+medication data. The data file follows the executable's stem — `med-auras-ss.exe` reads and writes
+`medications-med-auras-ss.json` beside `medications.json` — and the Windows Run entry does the same, so a renamed
+copy can never repoint the real widget's sign-in launch at itself. A renamed copy also never claims a sign-in launch
+on its own; its tray toggle still works if you deliberately want one. Both can run at the same time.
+
+```bash
+cp build/Release/med-auras.exe build/Release/med-auras-ss.exe
+```
+
+Keep `libwinpthread-1.dll` beside them, and re-copy after a rebuild — the copy is not a CMake target.
+
 #### Standalone executable
 
 The binary registered for Windows startup lives at `build\Release\med-auras.exe`. When built with MinGW it must be
@@ -307,6 +352,19 @@ That removes `libstdc++-6.dll` and `libgcc_s_seh-1.dll`. A full `-static` link i
 MinGW — its static `libmsvcrt`/`libwinpthread` fail with `undefined reference to __intrinsic_setjmpex` — so
 `libwinpthread-1.dll` remains a dependency and is kept beside the executable. **Keep those two files together.**
 
+#### Versioning
+
+Builds carry a version resource, set in one place — the `project(... VERSION ...)` line in `CMakeLists.txt` — and
+generated into the executable through `src/version.h.in`. Check a binary with:
+
+```bash
+powershell -c "(Get-Item build\Release\med-auras.exe).VersionInfo.FileVersion"
+```
+
+To bump, edit that one `VERSION` line and set `MED_AURAS_VERSION_SUFFIX` to `""` for a release or `"-dev"` while the
+work is in progress — nothing else needs editing. Copy each build worth keeping to `dist/med-auras-<version>.exe`.
+Binaries stay out of git; `docs/VERSIONING.md` is the record of what each archived build was.
+
 ### Release verification
 
 Run the automated model, persistence, legacy-file, malformed-file, and failed-write checks in each configured build:
@@ -318,23 +376,29 @@ ctest --test-dir <build-directory> -C Release --output-on-failure
 
 Before release, manually verify this daily-use path on Windows 11:
 
-1. Configure medications, click **Taken**, terminate/relaunch, and confirm the saved anchor and derived timer remain
-   correct.
+1. Configure medications, click **Taken**, terminate/relaunch, and confirm the saved schedule and active occurrence
+   remain correct.
 2. Exercise edit via the icon tile, pause/resume, removal, icon fallback, tray hide/show, startup enable/disable,
    position restoration, monitor removal, always-on-top, and keyboard operation including Shift+F10 → **Edit...**.
 3. Confirm active timers remain correct across sleep, hibernation, Windows restart, and wall-clock advancement.
-4. Observe resource use in each state. Hidden, all-ready/paused, and fullscreen-app-in-front should all schedule no
-   repaint and hold CPU at effectively 0%. A visible, running countdown ticks once per second and costs roughly 0.5%
-   of one core; confirm it returns to zero when the widget is hidden or covered by a fullscreen app.
-5. Confirm memory, handle, USER, and GDI counts remain stable through repeated use and that the process owns no network
+4. Exercise each schedule type: an hourly interval that does not divide 24 crossing midnight, a daily list, a weekly
+   list, and a monthly entry on the 31st skipping a short month. Confirm scheduled times do not move when **Taken**
+   is pressed early or late, that leaving a dose unattended shows a growing overdue duration measured from the first
+   dose missed, and that one press then records the dose due now, logs the rest as missed, and lands on a future
+   occurrence. Check **History...** shows them, and that a pause/resume cycle adds no missed entries.
+5. Observe resource use in each state. Hidden, all-paused, and fullscreen-app-in-front should all schedule no repaint
+   and hold CPU at effectively 0%. A visible, running countdown ticks once per second and costs roughly 0.5% of one
+   core; confirm it returns to zero when the widget is hidden or covered by a fullscreen app, and that a card left
+   overdue for more than an hour drops to a once-a-minute tick and then to hourly past a day.
+6. Confirm memory, handle, USER, and GDI counts remain stable through repeated use and that the process owns no network
    endpoints. The per-second repaint makes handle stability worth rechecking specifically. Memory settles near 59 MB
    because of the Direct3D/composition device; what matters is that it is stable, not small.
-6. Drag the widget across other windows and over a high-contrast wallpaper and confirm the card interiors track what
+7. Drag the widget across other windows and over a high-contrast wallpaper and confirm the card interiors track what
    is behind them, that the gaps between cards stay fully transparent, and that text, icons, and the progress bar
    stay sharp. Repeat in solid mode and at a low opacity, where text must stay fully opaque over a translucent card.
-7. Confirm clicks pass through the row gaps and the rounded outer corners to whatever is beneath, and that the
+8. Confirm clicks pass through the row gaps and the rounded outer corners to whatever is beneath, and that the
    **Taken** button and the icon tile still respond. `WM_NCHITTEST` should answer `HTCLIENT` only inside a card.
-8. Launch `build\Release\med-auras.exe` with CLion off `PATH` to confirm the shipped binary has no toolchain-local
+9. Launch `build\Release\med-auras.exe` with CLion off `PATH` to confirm the shipped binary has no toolchain-local
    DLL dependency.
 
 The 2026-08-13 development verification produced passing MSVC and CLion-MinGW Release builds/CTest runs. A 20-second
@@ -361,10 +425,9 @@ changes and sleep/resume were **not** re-tested against the new presentation pat
 
 Suggested states:
 
-- Ready: green or clearly highlighted
 - Soon: amber/orange
-- Active cooldown: neutral/blue
-- Overdue or missed scheduled action: red, only if scheduled-dose behavior is added
+- Active countdown: neutral
+- Overdue: red
 - Paused: grey
 
 The UI should remain readable without relying on color alone.

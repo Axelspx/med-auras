@@ -1,0 +1,7 @@
+#pragma once
+
+// Generated from src/version.h.in by CMake. Bump the version in CMakeLists.txt.
+#define MED_AURAS_VERSION_MAJOR  @PROJECT_VERSION_MAJOR@
+#define MED_AURAS_VERSION_MINOR  @PROJECT_VERSION_MINOR@
+#define MED_AURAS_VERSION_PATCH  @PROJECT_VERSION_PATCH@
+#define MED_AURAS_VERSION_STRING "@MED_AURAS_VERSION_STRING@"

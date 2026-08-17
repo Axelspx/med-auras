@@ -1,5 +1,9 @@
 # SCHEDULE_SYSTEM.md
 
+**Status: implemented, 2026-08-16.** This document is the contract. The decisions section at the end records the
+points that were resolved while building it, including one place where the implementation deliberately differs from
+rule 6 below.
+
 ## Purpose
 
 Replace the current free-running interval timer with a fixed recurring medication schedule.
@@ -177,3 +181,44 @@ Those UI Layout Examples are only a rough example/guideline. If you can see/thin
 - Do not use `last_taken + interval` to determine the next dose.
 - Preserve existing persistence and low-resource/event-driven behaviour where possible.
 - Schedule changes should recompute the active occurrence deterministically from the new schedule.
+
+## Decisions
+
+**Catch-up, and the deliberate deviation from rule 6.** A press of **Taken** records the occurrence that is due
+*now* — the latest unresolved one at or before the click — marks every unresolved occurrence before it as `missed`,
+and advances to the next. So one press after a three-day absence resolves everything and lands on a future
+occurrence; it never leaves another past occurrence active, and there is no catch-up sequence of presses. This skips
+occurrences, which rule 6 forbids, but the skip is user-initiated by the press rather than automatic. Nothing is ever
+resolved by the passage of time alone: an unattended occurrence stays active and overdue indefinitely, and the app
+writes nothing on its own. Missed doses are never presented as owed and the app never suggests making one up.
+
+**Overdue is one duration, not a count.** It is measured from the first unresolved occurrence, and the scheduled time
+the card displays is that same occurrence, so the number and the time next to it always agree. There is no "N doses
+behind" language.
+
+**Pause is a non-destructive suspend.** No occurrences accrue as missed while paused, which is what keeps a long hold
+from producing a history full of noise. The history is retained, and resuming recomputes the active occurrence as the
+next future one. Both events are written to the history so a gap reads as paused rather than unexplained. It exists
+mainly because history makes removal destructive in a way it was not before.
+
+**Every occurrence is logged**, viewable per medication from the row context menu, capped at the most recent 500
+records — over a year at one dose a day.
+
+**Hourly reuses `interval_minutes` plus an anchor timestamp** rather than a whole number of hours. This is what lets a
+pre-schedule file migrate with its interval untouched; rounding a 30-minute schedule up to an hour would be the app
+altering a prescribed interval, which `AGENTS.md` forbids. Hourly repeats continuously from the anchor and does not
+restart each day, so an interval that does not divide 24 walks across days. Occurrences exist before the anchor too,
+which is invisible except that a card tracking the first dose still has a previous occurrence to size its progress
+bar against.
+
+**The progress bar drains** across the gap between the previous scheduled occurrence and the active one, and reads
+empty once overdue rather than saturating full — the `OVERDUE` badge, red border, and red countdown already carry the
+state, and this keeps the existing visual language unchanged.
+
+**Occurrence scanning is a day-by-day walk**, not modular arithmetic: generate the times a schedule places on a local
+date, step the date until one lands on the right side of the cursor. Monthly's "skip a day the month does not have"
+falls out for free, and the worst case is about 31 cheap iterations. Schedule entries are local wall-clock and are
+converted to UTC per date, so a fixed time stays fixed across a daylight-saving change.
+
+**Deferred:** a `skipped` status and a manual skip action to resolve a dose without recording one. `DoseStatus` has
+room for it.

@@ -54,9 +54,11 @@ it.
 
 The countdown currently shows seconds, which the user requested explicitly, so it ticks once per second while
 a countdown is on screen. That costs roughly 0.5% of one core. It is the exception, not licence for
-high-frequency work generally: a coarser format must go back to a coarser tick. No timer is scheduled at all
-when the widget is hidden or when every medication is ready or paused, and the per-second repaint is skipped
-while a fullscreen or presentation-mode app is in front, which returns the process to zero.
+high-frequency work generally: a coarser format must go back to a coarser tick, and the overdue text does
+exactly that — seconds for the first hour, then whole minutes to a 60-second tick, then whole hours to an
+hourly one. No timer is scheduled at all when the widget is hidden or when every medication is paused, and
+the repaint is skipped while a fullscreen or presentation-mode app is in front, which returns the process to
+zero.
 
 This constraint is about *recurring work*, and that part still holds exactly. The footprint no longer does:
 the live backdrop blur hosts a Direct3D 11 device and the composition runtime, which costs roughly 59 MB and
@@ -68,27 +70,40 @@ Timer state must survive application restart, Windows restart, sleep, and hibern
 
 ## Timer Model
 
-Store facts, not continuously changing countdown state.
+Store facts, not continuously changing countdown state. Never persist a value such as `remaining_seconds`.
 
-Example:
-
-```text
-timer_anchor_at
-interval_minutes
-```
-
-Derive:
+A medication follows a **fixed recurring schedule** and tracks exactly one **active occurrence** at a time: the
+earliest scheduled dose that has been neither taken nor missed. The schedule is authoritative. When a dose is
+actually taken changes nothing about when later doses are due.
 
 ```text
-next_available_at = timer_anchor_at + interval
-remaining = next_available_at - now
+schedule_type    hourly | daily | weekly | monthly
+active_at        the tracked occurrence
+remaining        active_at - now        (negative means overdue)
 ```
 
-Never persist a value such as `remaining_seconds`.
+Rules that must not be broken:
 
-For a newly configured medication, the user-selected start date/time is the initial timer anchor and defaults to the
-current local date/time. After the user clicks **Taken**, that click timestamp becomes the new anchor. Store timestamps
-in UTC and present/edit them in local time.
+- The next occurrence is derived from the schedule, never from `taken_at`. `last_taken + interval` is wrong.
+- Taking a dose early or late does not move any later dose.
+- An occurrence whose time has passed stays active and becomes overdue. Nothing auto-skips or auto-advances it.
+- **Taken** records the occurrence that is due *now* — the latest unresolved one at or before the click — marks every
+  unresolved occurrence before it as missed, and advances to the next. One press always resolves everything
+  outstanding, so a press never lands on another past occurrence.
+- Overdue is reported as one duration measured from the first unresolved occurrence. No dose count, and never a
+  suggestion to make missed doses up.
+- All next-occurrence calculation lives in `medication.cpp`. UI code must not work out when a dose is due.
+- A schedule change recomputes the active occurrence from scratch. Editing only a name or icon leaves it alone.
+
+Hourly is stored as `interval_minutes` plus an anchor timestamp, which is what makes a pre-schedule file migrate
+without altering anyone's interval. It repeats continuously from the anchor and does not restart each day. Daily,
+weekly, and monthly are lists of fixed local wall-clock times; a monthly day a given month does not have is skipped.
+
+Timestamps are stored in UTC and presented and edited in local time. Schedule entries are local wall-clock, so a
+fixed time stays fixed across a daylight-saving change.
+
+Every resolved occurrence is appended to a per-medication history (`taken`, `missed`, `paused`, `resumed`), viewable
+from the row context menu, capped at the most recent 500 records.
 
 ## MVP Scope
 
@@ -102,12 +117,18 @@ Each medication needs:
 - name
 - dose
 - optional icon path/resource
-- interval in minutes
-- last-taken timestamp
+- schedule type and its entries
+- the active occurrence timestamp
+- dose history
 - enabled/paused state
 
-The editor may accept fractional intervals in minutes, hours, days, or weeks, but must normalize them to a positive
-whole-minute value for the model and JSON. For example, `3.5 days` is stored as `5040` minutes.
+For an hourly schedule the editor may accept fractional intervals in minutes, hours, days, or weeks, but must
+normalize them to a positive whole-minute value for the model and JSON. For example, `3.5 days` is stored as `5040`
+minutes. The other schedule types are lists of local times, with a weekday for weekly and a day of month for monthly.
+
+Pausing is a non-destructive suspend, not a stopped clock: no occurrences accrue as missed while paused, the history
+is kept, and resuming recomputes the active occurrence as the next future one. It exists so a medication can be set
+aside without deleting its history.
 
 ### Main widget
 
@@ -146,6 +167,7 @@ Keep uncommon actions out of the primary workflow:
 
 - right-click row for medication actions
 - edit
+- dose history
 - pause/resume
 - remove
 - drag widget
@@ -256,12 +278,29 @@ When modifying code:
 6. Build and test after meaningful changes.
 7. Keep warnings clean where practical.
 8. Do not silently expand scope.
+9. Version and archive any build worth keeping (see **Versioning** below).
 
 Building, as of 2026-08-16: CMake configure fails for MSVC 19.50 (`target_compile_features no known features`), so
 MinGW is the only toolchain that configures and MSVC must be checked by invoking `cl` directly. The fix is known and
 recorded in the README but has not been applied. The executable at `build\Release\med-auras.exe` is the one Windows
 startup launches; when built with MinGW it needs `-static-libgcc -static-libstdc++` and the `libwinpthread-1.dll`
 kept beside it, or it will not start outside CLion.
+
+### Versioning
+
+Every build carries a version. The number lives in **one** place — the `project(... VERSION ...)` line of
+`CMakeLists.txt` — and reaches the executable via the generated `version.h` and the `VS_VERSION_INFO` block in
+`src/resources.rc`. To ship a build:
+
+1. Bump `VERSION` in `CMakeLists.txt`. Pre-1.0 semantics: patch for a fix, minor for a user-visible feature.
+2. Set `MED_AURAS_VERSION_SUFFIX` to `""` to release, or leave `"-dev"` while that version is still in progress.
+3. Build, then confirm:
+   `powershell -c "(Get-Item build\Release\med-auras.exe).VersionInfo.FileVersion"`
+4. Copy to `dist/med-auras-<version>.exe` and add a row to the table in `docs/VERSIONING.md` saying what it was.
+
+Do not add a second place to edit a version number, do not hand-edit a number into `resources.rc`, and do not pass the
+version string as a `-D` define — `windres` mangles the quoting and the RC compile fails. Binaries are gitignored on
+purpose; `docs/VERSIONING.md` is the record, not git. Full detail and the build history are in that file.
 
 ## Response Style
 
@@ -303,7 +342,10 @@ startup, tray show/hide, widget position restoration, drag/lock/always-on-top, m
 awareness.
 
 Work since then is the post-MVP UI redesign recorded in `docs/DESIGN_PLAN.md`, which remains the authoritative record
-for visual decisions. Current rendering state:
+for visual decisions, and the schedule system recorded in `docs/SCHEDULE_SYSTEM.md`, which replaced the free-running
+interval cooldown with fixed recurring schedules, overdue tracking, and per-medication dose history. Pre-schedule
+JSON files migrate on load to an hourly schedule anchored at their last dose, keeping the same interval and the same
+pending dose. Current rendering state:
 
 - One borderless top-level window. Each frame is drawn into a premultiplied 32-bit DIB, so Direct2D owns per-pixel
   alpha and card corners and row gaps are anti-aliased.
@@ -328,8 +370,12 @@ for visual decisions. Current rendering state:
   parent, and only on a real state transition, or the frame is republished continuously.
 - Cards are 364 x 66 DIP. There is one action control, **Taken**. Editing is reached by clicking the icon tile,
   which crossfades to a pencil on hover; both it and the Taken circle show a hand cursor.
-- The countdown reads `1:20:00` above an hour and `MM:SS` below it, and its text is drawn twice against a clip at
-  the progress fill edge so each half contrasts the colour actually beneath it.
+- The progress bar carries the scheduled time of the active occurrence on the left and the countdown on the right;
+  hovering replaces the countdown with the full date and drops the short time. The countdown reads `1:20:00` above an
+  hour and `MM:SS` below it, then `MM:SS overdue`, `2h 14m overdue`, `3d 4h overdue` once the occurrence has passed.
+  Each run is drawn twice against a clip at the progress fill edge so it contrasts the colour actually beneath it.
+- The bar drains across the gap between the previous scheduled occurrence and the active one, and reads empty once
+  overdue, where the `OVERDUE` badge, the red border, and the red countdown carry the state.
 
 Selectable Solid/Mica/Acrylic background materials were implemented and then removed. Do not reintroduce a DWM
 system backdrop, `SetWindowRgn` silhouette, or second presentation path without reading the withdrawal rationale in

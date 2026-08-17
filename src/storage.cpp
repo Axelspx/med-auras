@@ -8,10 +8,12 @@
 #include <fstream>
 #include <iomanip>
 #include <limits>
+#include <iterator>
 #include <map>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <system_error>
 #include <variant>
 
@@ -311,25 +313,101 @@ std::string escape_json(const std::wstring& value) {
     return output.str();
 }
 
-Medication medication_from_json(const JsonValue& value) {
-    const auto& object = as<JsonValue::Object>(value, "medication");
+constexpr std::string_view schedule_type_names[]{"hourly", "daily", "weekly", "monthly"};
+
+ScheduleType schedule_type_from_name(const std::string& name) {
+    for (std::size_t index = 0; index < std::size(schedule_type_names); ++index) {
+        if (schedule_type_names[index] == name) return static_cast<ScheduleType>(index);
+    }
+    throw std::runtime_error("Medication JSON has an unknown schedule_type");
+}
+
+constexpr std::string_view dose_status_names[]{"taken", "missed", "paused", "resumed"};
+
+DoseStatus dose_status_from_name(const std::string& name) {
+    for (std::size_t index = 0; index < std::size(dose_status_names); ++index) {
+        if (dose_status_names[index] == name) return static_cast<DoseStatus>(index);
+    }
+    throw std::runtime_error("Medication JSON has an unknown history status");
+}
+
+int bounded_integer(const JsonValue& value, const char* field, const int low, const int high) {
+    const std::int64_t number = as<std::int64_t>(value, field);
+    if (number < low || number > high) {
+        throw std::runtime_error(std::string{"Medication JSON field '"} + field + "' is out of range");
+    }
+    return static_cast<int>(number);
+}
+
+std::chrono::minutes interval_from_json(const JsonValue::Object& object) {
     const std::int64_t interval = as<std::int64_t>(required(object, "interval_minutes"), "interval_minutes");
     if (interval <= 0) {
         throw std::runtime_error("Medication interval_minutes must be positive");
     }
+    return std::chrono::minutes{interval};
+}
 
+// Files written before the schedule system carried a free-running interval and the last-taken
+// timestamp it counted from. That is exactly an hourly schedule anchored at the last dose, and the
+// one occurrence that was pending stays pending, overdue if its time has already gone by.
+void adopt_legacy_schedule(Medication& medication, const JsonValue::Object& object) {
+    medication.schedule_type = ScheduleType::hourly;
+    medication.interval = interval_from_json(object);
+    const auto taken = object.find("last_taken_at");
+    const bool ever_taken = taken != object.end() && !std::holds_alternative<std::nullptr_t>(taken->second.value);
+    medication.anchor_at = ever_taken ? parse_timestamp(as<std::string>(taken->second, "last_taken_at"))
+                                      : std::chrono::system_clock::now() - medication.interval;
+    medication.active_at = medication.anchor_at + medication.interval;
+}
+
+Medication medication_from_json(const JsonValue& value) {
+    const auto& object = as<JsonValue::Object>(value, "medication");
     Medication medication{
         .id = from_utf8(as<std::string>(required(object, "id"), "id")),
         .name = from_utf8(as<std::string>(required(object, "name"), "name")),
         .dose = from_utf8(as<std::string>(required(object, "dose"), "dose")),
-        .interval = std::chrono::minutes{interval},
         .enabled = as<bool>(required(object, "enabled"), "enabled"),
     };
     if (const auto icon = object.find("icon_path"); icon != object.end() && !std::holds_alternative<std::nullptr_t>(icon->second.value)) {
         medication.icon_path = from_utf8(as<std::string>(icon->second, "icon_path"));
     }
-    if (const auto taken = object.find("last_taken_at"); taken != object.end() && !std::holds_alternative<std::nullptr_t>(taken->second.value)) {
-        medication.last_taken_at = parse_timestamp(as<std::string>(taken->second, "last_taken_at"));
+
+    const auto type = object.find("schedule_type");
+    if (type == object.end()) {
+        adopt_legacy_schedule(medication, object);
+    } else {
+        medication.schedule_type = schedule_type_from_name(as<std::string>(type->second, "schedule_type"));
+        if (medication.schedule_type == ScheduleType::hourly) {
+            medication.interval = interval_from_json(object);
+            medication.anchor_at = parse_timestamp(as<std::string>(required(object, "anchor_at"), "anchor_at"));
+        } else {
+            for (const JsonValue& entry : as<JsonValue::Array>(required(object, "entries"), "entries")) {
+                const auto& fields = as<JsonValue::Object>(entry, "entries");
+                medication.entries.push_back(ScheduleEntry{
+                    .day = bounded_integer(required(fields, "day"), "day", 0, 31),
+                    .minute = bounded_integer(required(fields, "minute"), "minute", 0, 1'439),
+                });
+            }
+        }
+        medication.active_at = parse_timestamp(as<std::string>(required(object, "active_at"), "active_at"));
+        if (const auto history = object.find("history"); history != object.end()) {
+            for (const JsonValue& record : as<JsonValue::Array>(history->second, "history")) {
+                const auto& fields = as<JsonValue::Object>(record, "history");
+                DoseRecord dose{
+                    .scheduled_at = parse_timestamp(as<std::string>(required(fields, "scheduled_at"), "scheduled_at")),
+                    .status = dose_status_from_name(as<std::string>(required(fields, "status"), "status")),
+                };
+                if (const auto at = fields.find("taken_at");
+                    at != fields.end() && !std::holds_alternative<std::nullptr_t>(at->second.value)) {
+                    dose.taken_at = parse_timestamp(as<std::string>(at->second, "taken_at"));
+                }
+                medication.history.push_back(dose);
+            }
+        }
+    }
+
+    if (!medication.schedule_is_valid()) {
+        throw std::runtime_error("Medication JSON has an incomplete schedule");
     }
     return medication;
 }
@@ -430,11 +508,31 @@ void save_medications(
                << "      \"icon_path\": ";
         if (medication.icon_path) output << '"' << escape_json(*medication.icon_path) << '"';
         else output << "null";
-        output << ",\n      \"interval_minutes\": " << medication.interval.count() << ",\n"
-               << "      \"last_taken_at\": ";
-        if (medication.last_taken_at) output << '"' << format_timestamp(*medication.last_taken_at) << '"';
-        else output << "null";
-        output << ",\n      \"enabled\": " << (medication.enabled ? "true" : "false") << "\n    }";
+        output << ",\n      \"enabled\": " << (medication.enabled ? "true" : "false") << ",\n"
+               << "      \"schedule_type\": \""
+               << schedule_type_names[static_cast<std::size_t>(medication.schedule_type)] << "\",\n";
+        if (medication.schedule_type == ScheduleType::hourly) {
+            output << "      \"interval_minutes\": " << medication.interval.count() << ",\n"
+                   << "      \"anchor_at\": \"" << format_timestamp(medication.anchor_at) << "\",\n";
+        } else {
+            output << "      \"entries\": [";
+            for (std::size_t entry = 0; entry < medication.entries.size(); ++entry) {
+                output << (entry == 0 ? "" : ", ") << "{ \"day\": " << medication.entries[entry].day
+                       << ", \"minute\": " << medication.entries[entry].minute << " }";
+            }
+            output << "],\n";
+        }
+        output << "      \"active_at\": \"" << format_timestamp(medication.active_at) << "\",\n"
+               << "      \"history\": [";
+        for (std::size_t record = 0; record < medication.history.size(); ++record) {
+            const DoseRecord& dose = medication.history[record];
+            output << (record == 0 ? "\n" : ",\n") << "        { \"scheduled_at\": \""
+                   << format_timestamp(dose.scheduled_at) << "\", \"taken_at\": ";
+            if (dose.taken_at) output << '"' << format_timestamp(*dose.taken_at) << '"';
+            else output << "null";
+            output << ", \"status\": \"" << dose_status_names[static_cast<std::size_t>(dose.status)] << "\" }";
+        }
+        output << (medication.history.empty() ? "]\n    }" : "\n      ]\n    }");
     }
     output << (medications.empty() ? "]" : "\n  ]") << ",\n  \"settings\": {\n" << "    \"window_x\": ";
     if (settings.window_x) output << *settings.window_x;
